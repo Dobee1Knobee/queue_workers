@@ -6,8 +6,17 @@ const { queueConsumer } = require('./utils/queueConsumer')
 const { zoomThreadCallIn } = require('./utils/zoom/zoomThreadCallIn')
 const { zoomThreadSmsIn } = require('./utils/zoom/zoomThreadSmsIn')
 
+// Middleware для парсинга JSON
+app.use(express.json())
+
 app.get('/', (req, res) => {
 	res.send('Hello World')
+})
+
+// Endpoint для приема webhook SMS
+app.post('/webhook/sms', (req, res) => {
+	console.log('📨 Webhook SMS получен:', req.body)
+	res.status(200).json({ success: true, message: 'Webhook received' })
 })
 
 // Запускаем consumer при старте приложения
@@ -22,7 +31,7 @@ app.listen(port, async () => {
 		const amqp = require('amqplib')
 		const url = `amqp://${process.env.RABBITMQ_USER}:${process.env.RABBITMQ_PASS}@${process.env.NGROK_TCP_HOST}:${process.env.NGROK_TCP_PORT}`
 		const connection = await amqp.connect(url)
-		const channel = await connection.createChannel()
+		const channelCall = await connection.createChannel()
 		const chanelSms = await connection.createChannel()
 		await channelCall.assertQueue('call_in_test', { durable: true })
 		await chanelSms.assertQueue('sms_in_test', { durable: true })

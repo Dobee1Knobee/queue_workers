@@ -3,11 +3,61 @@ const mongoose = require('mongoose')
 const logger = require('pino')()
 const { smsSchema } = require('../../models/sms_model')
 const { clientFinder, createNewClient } = require('../clientFinder')
+const { getCallConnection } = require('./zoomThreadCallIn')
 const axios = require('axios')
 // Создаем отдельное подключение для SMS базы данных
 // чтобы избежать конфликтов с другими подключениями
 let smsConnection = null
 let SmsModel = null
+
+// Подключение к базе данных tvmount для работы с fastQuiz
+let tvmountConnection = null
+
+const getTvmountConnection = async () => {
+	// Используем TVMOUNT_DB_URL если задан, иначе CLIENT_DB_URL, иначе формируем из SMS_DB_URL
+	let dbUrl = process.env.TVMOUNT_DB_URL || process.env.CLIENTS_DB_URL
+	
+	if (!dbUrl && process.env.SMS_DB_URL) {
+		// Заменяем имя базы данных в строке подключения на tvmount
+		dbUrl = process.env.SMS_DB_URL.replace(/\/[^\/\?]+(\?|$)/, '/tvmount$1')
+	}
+	
+	if (!dbUrl) {
+		throw new Error('Переменная TVMOUNT_DB_URL, CLIENT_DB_URL или SMS_DB_URL не определена в .env файле')
+	}
+
+	// Если подключение уже существует и активно, возвращаем его
+	if (tvmountConnection && tvmountConnection.readyState === 1) {
+		return tvmountConnection
+	}
+
+	// Создаем новое подключение
+	tvmountConnection = mongoose.createConnection(dbUrl, {
+		bufferCommands: false,
+		maxPoolSize: 10,
+	})
+
+	// Ждем, пока подключение установится
+	await new Promise((resolve, reject) => {
+		if (tvmountConnection.readyState === 1) {
+			logger.info('✅ Connected to tvmount database')
+			logger.info(`Database name: ${tvmountConnection.name}`)
+			resolve()
+		} else {
+			tvmountConnection.once('connected', () => {
+				logger.info('✅ Connected to tvmount database')
+				logger.info(`Database name: ${tvmountConnection.name}`)
+				resolve()
+			})
+			tvmountConnection.once('error', err => {
+				logger.error('❌ Error connecting to tvmount database:', err.message)
+				reject(err)
+			})
+		}
+	})
+
+	return tvmountConnection
+}
 
 const getSmsConnection = async () => {
 	if (!process.env.SMS_DB_URL) {
@@ -98,20 +148,24 @@ const zoomThreadSmsIn = async data => {
 
 		// Получаем подключение и модель
 		const { connection, model } = await getSmsConnection()
-
+		const { callConection, callModel } = await getCallConnection()
 		// Проверяем, не существует ли уже сообщение с таким messageId
 		let existingSms = null
 		if (messageId) {
-			existingSms = await model.findOne({ messageId })
+			existingSms = await model.findOne({clientId: clientId })
+			if(!existingSms){
+				existingCall = await callModel.findOne({clientId: clientId })
+			}
 		}
 
-		if (existingSms) {
-			logger.info(`⚠️ SMS с messageId ${messageId} уже существует, пропускаем`)
-			return { success: true, skipped: true, message: 'SMS already exists' }
+		if (existingSms || existingCall) {
+			logger.info(`⚠️ SMS или Call с клиентом ${clientId} уже существует, пропускаем`)
+			return { success: true, skipped: true, message: 'SMS or Call already exists' }
 		}
 
-		// Ищем заказы в коллекции fastQuiz в базе production
-		const FastQuizModel = connection.model(
+		// Ищем заказы в коллекции fastQuiz в базе tvmount
+		const tvmountConn = await getTvmountConnection()
+		const FastQuizModel = tvmountConn.model(
 			'fastQuiz',
 			new mongoose.Schema({}, { strict: false }),
 			'fastQuiz'
@@ -123,10 +177,11 @@ const zoomThreadSmsIn = async data => {
 			logger.info(`⚠️ Заказ уже существует`)
 			isFirstMessage = false
 		} else {
-			const quizSubmissionModel = connection.model(
-				'quizSubmission',
+			// quiz_submission также из базы tvmount
+			const quizSubmissionModel = tvmountConn.model(
+				'quiz_submission',
 				new mongoose.Schema({}, { strict: false }),
-				'quizSubmission'
+				'quiz_submission'
 			)
 			const quizSubmission = await quizSubmissionModel.find({
 				client_id: clientId,
@@ -136,9 +191,12 @@ const zoomThreadSmsIn = async data => {
 				isFirstMessage = false
 			} else {
 				isFirstMessage = true
+				// URL webhook из переменной окружения или по умолчанию localhost:3000
+				const webhookUrl = process.env.WEBHOOK_SMS_URL || 'http://localhost:3000/webhook/sms'
+				logger.info(`ЗАЯВКА ПО ПЕРВОМУ СООБЩЕНИЮ`)
 				axios
 					.post(
-						'http://localhost:8080/webhook/sms',
+						webhookUrl,
 						{
 							smsType: smsType,
 							isFirstMessage: isFirstMessage,
@@ -165,7 +223,23 @@ const zoomThreadSmsIn = async data => {
 						)
 					})
 					.catch(error => {
-						logger.error(`❌ Ошибка в zoomThreadSmsIn: ${error.message}`)
+						// Если сервер недоступен (ECONNREFUSED), это не критично - логируем как предупреждение
+						if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+							logger.warn(
+								`⚠️ Webhook сервер недоступен (${error.config?.url}): ${error.message}. SMS сохранено в БД.`
+							)
+						} else {
+							// Другие ошибки логируем как ошибки
+							logger.error(
+								{
+									err: error,
+									message: error.message,
+									code: error.code,
+									url: error.config?.url,
+								},
+								'❌ Ошибка отправки webhook'
+							)
+						}
 					})
 			}
 		}
@@ -198,9 +272,16 @@ const zoomThreadSmsIn = async data => {
 			messageId: messageId,
 		}
 	} catch (error) {
-		logger.error('❌ Ошибка в zoomThreadSmsIn:', error.message)
+		logger.error(
+			{
+				err: error,
+				message: error.message,
+				stack: error.stack,
+			},
+			'❌ Ошибка в zoomThreadSmsIn'
+		)
 		throw error
 	}
 }
 
-module.exports = { zoomThreadSmsIn }
+module.exports = { zoomThreadSmsIn, getSmsConnection }
