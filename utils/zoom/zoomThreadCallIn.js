@@ -3,7 +3,7 @@ const mongoose = require('mongoose')
 const logger = require('pino')()
 const { callSchema } = require('../../models/call_model')
 const { clientFinder, createNewClient } = require('../clientFinder')
-const { getSmsConnection } = require('./zoomThreadSmsIn')
+const axios = require('axios')
 
 let callConnection = null
 let CallModel = null
@@ -126,7 +126,7 @@ const zoomThreadCallIn = async data => {
 			: direction === 'outbound'
 			? caller_number
 			: null
-
+	
 	// Дополнительная проверка на внешний номер
 	const external =
 		caller_number_source === 'external' && caller_number
@@ -177,6 +177,8 @@ const zoomThreadCallIn = async data => {
 	}
 	
 	// Проверяем, не существует ли уже SMS или звонок с таким clientId
+	// Ленивая загрузка для избежания циклической зависимости
+	const { getSmsConnection } = require('./zoomThreadSmsIn')
 	const { model: smsModel } = await getSmsConnection()
 	const { model: callModel } = await getCallConnection()
 	
@@ -191,6 +193,14 @@ const zoomThreadCallIn = async data => {
 	try {
 		// Ищем заказы в коллекции fastQuiz в базе tvmount
 		const tvmountConn = await getTvmountConnection()
+		const UsersModel = tvmountConn.model("users", new mongoose.Schema({}, { strict: false }), "users")
+		const responsibleManager = await UsersModel.findOne({
+			extension_number:+ext
+		}) 
+		if(responsibleManager){
+			//TODO: Добавить ответственного менеджера в заказ
+			responsibleManagerId = responsibleManager.id
+		}
 		const FastQuizModel = tvmountConn.model(
 			'fastQuiz',
 			new mongoose.Schema({}, { strict: false }),
@@ -226,6 +236,7 @@ const zoomThreadCallIn = async data => {
 			result: result,
 			call_end_time: callEndDate,
 			customer_number: customerNumber,
+			responsible_manager_id: responsibleManager?.id,
 		}
 
 		logger.info('💾 Сохраняем звонок:', callDataToSave)
@@ -241,6 +252,52 @@ const zoomThreadCallIn = async data => {
 			logger.info(
 				`✅ Первый заказ по ${direction} сохранен в базу данных: ${customerNumber}`
 			)
+			
+			// Отправляем webhook для первой заявки
+			const webhookUrl = process.env.WEBHOOK_CALL_URL || process.env.WEBHOOK_SMS_URL || 'http://localhost:3000/webhook/call'
+			logger.info(`📞 ЗАЯВКА ПО ПЕРВОМУ ЗВОНКУ`)
+			axios
+				.post(
+					webhookUrl,
+					{
+						type: 'call',
+						direction: direction,
+						phone: customerNumber,
+						clientId: clientId,
+						ext: ext,
+						duration: duration,
+						result: result,
+						callEndTime: callEndDate,
+						isFirstMessage: true,
+					},
+					{
+						headers: {
+							'Content-Type': 'application/json',
+						},
+					}
+				)
+				.then(response => {
+					logger.info(`✅ Webhook отправлен успешно для звонка: ${customerNumber}`)
+				})
+				.catch(error => {
+					// Если сервер недоступен (ECONNREFUSED), это не критично - логируем как предупреждение
+					if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+						logger.warn(
+							`⚠️ Webhook сервер недоступен (${error.config?.url}): ${error.message}. Call сохранен в БД.`
+						)
+					} else {
+						// Другие ошибки логируем как ошибки
+						logger.error(
+							{
+								err: error,
+								message: error.message,
+								code: error.code,
+								url: error.config?.url,
+							},
+							'❌ Ошибка отправки webhook для звонка'
+						)
+					}
+				})
 		}
 	} catch (error) {
 		logger.error(

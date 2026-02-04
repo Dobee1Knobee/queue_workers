@@ -3,7 +3,6 @@ const mongoose = require('mongoose')
 const logger = require('pino')()
 const { smsSchema } = require('../../models/sms_model')
 const { clientFinder, createNewClient } = require('../clientFinder')
-const { getCallConnection } = require('./zoomThreadCallIn')
 const axios = require('axios')
 // Создаем отдельное подключение для SMS базы данных
 // чтобы избежать конфликтов с другими подключениями
@@ -101,6 +100,42 @@ const getSmsConnection = async () => {
 	return { connection: smsConnection, model: SmsModel }
 }
 
+const getSmsType = event => {
+	if (event === 'phone.sms_received') return 'incoming'
+	if (event === 'phone.sms_sent') return 'outgoing'
+	return 'unknown'
+}
+
+const pickFirstPhone = members => {
+	if (!Array.isArray(members)) return null
+	return members.map(member => member?.phone_number).find(Boolean) || null
+}
+
+const getClientPhoneFromSms = (event, smsData) => {
+	if (event === 'phone.sms_received') {
+		return (
+			smsData.sender?.phone_number ||
+			smsData.from?.phone_number ||
+			smsData.from_member?.phone_number ||
+			smsData.from_phone_number ||
+			smsData.phone_number ||
+			null
+		)
+	}
+
+	if (event === 'phone.sms_sent') {
+		return (
+			pickFirstPhone(smsData.to_members) ||
+			smsData.to?.phone_number ||
+			smsData.to_member?.phone_number ||
+			smsData.to_phone_number ||
+			null
+		)
+	}
+
+	return null
+}
+
 const zoomThreadSmsIn = async data => {
 	logger.info('📱 Обработка SMS сообщения')
 
@@ -115,9 +150,9 @@ const zoomThreadSmsIn = async data => {
 		const smsData = data.body.payload.object
 
 		// Извлекаем данные из структуры Zoom
-		const phoneNumber = smsData.sender?.phone_number || null
-		const smsType =
-			data.body.event === 'phone.sms_received' ? 'incoming' : 'outgoing'
+		const eventType = data.body.event
+		const phoneNumber = getClientPhoneFromSms(eventType, smsData)
+		const smsType = getSmsType(eventType)
 
 		// Ищем клиента по номеру телефона
 		let client = await clientFinder(phoneNumber)
@@ -143,104 +178,114 @@ const zoomThreadSmsIn = async data => {
 			: new Date()
 		let isFirstMessage = true
 		if (!phoneNumber || !message) {
-			throw new Error('Отсутствуют обязательные поля: phone_number или message')
+			throw new Error(
+				`Отсутствуют обязательные поля: phone_number или message (event: ${eventType})`
+			)
 		}
 
 		// Получаем подключение и модель
 		const { connection, model } = await getSmsConnection()
-		const { callConection, callModel } = await getCallConnection()
+		// Ленивая загрузка для избежания циклической зависимости
+		const { getCallConnection } = require('./zoomThreadCallIn')
+		const { connection: callConnection, model: callModel } = await getCallConnection()
 		// Проверяем, не существует ли уже сообщение с таким messageId
 		let existingSms = null
-		if (messageId) {
-			existingSms = await model.findOne({clientId: clientId })
-			if(!existingSms){
-				existingCall = await callModel.findOne({clientId: clientId })
-			}
+		let existingCall = null
+		
+		existingSms = await model.findOne({ clientId: clientId })
+		if (!existingSms) {
+			existingCall = await callModel.findOne({ client_id: clientId })
 		}
 
-		if (existingSms || existingCall) {
-			logger.info(`⚠️ SMS или Call с клиентом ${clientId} уже существует, пропускаем`)
-			return { success: true, skipped: true, message: 'SMS or Call already exists' }
-		}
-
-		// Ищем заказы в коллекции fastQuiz в базе tvmount
-		const tvmountConn = await getTvmountConnection()
-		const FastQuizModel = tvmountConn.model(
-			'fastQuiz',
-			new mongoose.Schema({}, { strict: false }),
-			'fastQuiz'
-		)
-		const previewsOrder = await FastQuizModel.find({
-			client_id: clientId,
-		})
-		if (previewsOrder.length > 0) {
-			logger.info(`⚠️ Заказ уже существует`)
-			isFirstMessage = false
-		} else {
-			// quiz_submission также из базы tvmount
-			const quizSubmissionModel = tvmountConn.model(
-				'quiz_submission',
-				new mongoose.Schema({}, { strict: false }),
-				'quiz_submission'
+		const shouldSkipFirstMessage = Boolean(existingSms || existingCall)
+		if (shouldSkipFirstMessage) {
+			logger.info(
+				`⚠️ SMS или Call с клиентом ${clientId} уже существует, не создаём заявку, но сохраняем SMS`
 			)
-			const quizSubmission = await quizSubmissionModel.find({
+			isFirstMessage = false
+		}
+
+		if (!shouldSkipFirstMessage) {
+			// Ищем заказы в коллекции fastQuiz в базе tvmount
+			const tvmountConn = await getTvmountConnection()
+			const FastQuizModel = tvmountConn.model(
+				'fastQuiz',
+				new mongoose.Schema({}, { strict: false }),
+				'fastQuiz'
+			)
+			const previewsOrder = await FastQuizModel.find({
 				client_id: clientId,
 			})
-			if (quizSubmission.length > 0) {
+			if (previewsOrder.length > 0) {
 				logger.info(`⚠️ Заказ уже существует`)
 				isFirstMessage = false
 			} else {
-				isFirstMessage = true
-				// URL webhook из переменной окружения или по умолчанию localhost:3000
-				const webhookUrl = process.env.WEBHOOK_SMS_URL || 'http://localhost:3000/webhook/sms'
-				logger.info(`ЗАЯВКА ПО ПЕРВОМУ СООБЩЕНИЮ`)
-				axios
-					.post(
-						webhookUrl,
-						{
-							smsType: smsType,
-							isFirstMessage: isFirstMessage,
-							phone: phoneNumber,
-							clientId: clientId,
-							message: message,
-							messageId: messageId,
-							sessionId: sessionId,
-							ownerId: ownerId,
-							dateTime: dateTime,
-						},
-						{
-							headers: {
-								'Content-Type': 'application/json',
+				// quiz_submission также из базы tvmount
+				const quizSubmissionModel = tvmountConn.model(
+					'quiz_submission',
+					new mongoose.Schema({}, { strict: false }),
+					'quiz_submission'
+				)
+				const quizSubmission = await quizSubmissionModel.find({
+					client_id: clientId,
+				})
+				if (quizSubmission.length > 0) {
+					logger.info(`⚠️ Заказ уже существует`)
+					isFirstMessage = false
+				} else {
+					isFirstMessage = true
+					// URL webhook из переменной окружения или по умолчанию localhost:3000
+					const webhookUrl =
+						process.env.WEBHOOK_SMS_URL || 'http://localhost:3000/webhook/sms'
+					logger.info(`ЗАЯВКА ПО ПЕРВОМУ СООБЩЕНИЮ`)
+					axios
+						.post(
+							webhookUrl,
+							{
+								smsType: smsType,
+								isFirstMessage: isFirstMessage,
+								phone: phoneNumber,
+								clientId: clientId,
+								message: message,
+								messageId: messageId,
+								sessionId: sessionId,
+								ownerId: ownerId,
+								dateTime: dateTime,
 							},
-						}
-					)
-					.then(response => {
-						logger.info(
-							`✅ SMS сохранено в базу данных: ${phoneNumber} - ${message.substring(
-								0,
-								50
-							)}...`
-						)
-					})
-					.catch(error => {
-						// Если сервер недоступен (ECONNREFUSED), это не критично - логируем как предупреждение
-						if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
-							logger.warn(
-								`⚠️ Webhook сервер недоступен (${error.config?.url}): ${error.message}. SMS сохранено в БД.`
-							)
-						} else {
-							// Другие ошибки логируем как ошибки
-							logger.error(
-								{
-									err: error,
-									message: error.message,
-									code: error.code,
-									url: error.config?.url,
+							{
+								headers: {
+									'Content-Type': 'application/json',
 								},
-								'❌ Ошибка отправки webhook'
+							}
+						)
+						.then(response => {
+							logger.info(
+								`✅ SMS сохранено в базу данных: ${phoneNumber} - ${message.substring(
+									0,
+									50
+								)}...`
 							)
-						}
-					})
+						})
+						.catch(error => {
+							// Если сервер недоступен (ECONNREFUSED), это не критично - логируем как предупреждение
+							if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+								logger.warn(
+									`⚠️ Webhook сервер недоступен (${error.config?.url}): ${error.message}. SMS сохранено в БД.`
+								)
+							} else {
+								// Другие ошибки логируем как ошибки
+								logger.error(
+									{
+										err: error,
+										message: error.message,
+										code: error.code,
+										url: error.config?.url,
+									},
+									'❌ Ошибка отправки webhook'
+								)
+							}
+						})
+				}
 			}
 		}
 

@@ -1,7 +1,7 @@
 require('dotenv').config()
 const express = require('express')
 const app = express()
-const port = 3000
+const port = 8000
 const { queueConsumer } = require('./utils/queueConsumer')
 const { zoomThreadCallIn } = require('./utils/zoom/zoomThreadCallIn')
 const { zoomThreadSmsIn } = require('./utils/zoom/zoomThreadSmsIn')
@@ -16,6 +16,12 @@ app.get('/', (req, res) => {
 // Endpoint для приема webhook SMS
 app.post('/webhook/sms', (req, res) => {
 	console.log('📨 Webhook SMS получен:', req.body)
+	res.status(200).json({ success: true, message: 'Webhook received' })
+})
+
+// Endpoint для приема webhook Call
+app.post('/webhook/call', (req, res) => {
+	console.log('📞 Webhook Call получен:', req.body)
 	res.status(200).json({ success: true, message: 'Webhook received' })
 })
 
