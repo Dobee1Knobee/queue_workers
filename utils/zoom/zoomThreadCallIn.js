@@ -11,6 +11,44 @@ let CallModel = null
 // Подключение к базе данных tvmount для работы с fastQuiz
 let tvmountConnection = null
 
+const normalizeDigits = value => {
+	if (value === null || value === undefined) return ''
+	return String(value).replace(/\D/g, '')
+}
+
+const isLikelyExtension = digits => digits.length > 0 && digits.length <= 6
+
+const getInternalPartyId = (direction, log) => {
+	if (!direction) return null
+	if (direction === 'inbound') {
+		return log?.callee_id || null
+	}
+	if (direction === 'outbound') {
+		return log?.caller_id || null
+	}
+	return null
+}
+
+const getInternalExtension = (direction, log) => {
+	if (!direction) return null
+	const extFromField =
+		direction === 'inbound'
+			? log?.callee_extension_number
+			: direction === 'outbound'
+			? log?.caller_extension_number
+			: null
+	if (extFromField) return extFromField
+
+	if (log?.caller_number_source === 'extension') {
+		return log?.caller_number
+	}
+	if (log?.callee_number_source === 'extension') {
+		return log?.callee_number
+	}
+
+	return direction === 'inbound' ? log?.callee_number : log?.caller_number
+}
+
 const getTvmountConnection = async () => {
 	// Используем TVMOUNT_DB_URL если задан, иначе CLIENT_DB_URL, иначе формируем из CALL_DB_URL
 	let dbUrl = process.env.TVMOUNT_DB_URL || process.env.CLIENTS_DB_URL
@@ -108,6 +146,10 @@ const zoomThreadCallIn = async data => {
 		callee_number,
 		caller_number_source,
 		callee_number_source,
+		caller_extension_number,
+		callee_extension_number,
+		caller_id,
+		callee_id,
 	} = log
 
 	// 1) Номер клиента (внешний номер)
@@ -119,13 +161,15 @@ const zoomThreadCallIn = async data => {
 			? callee_number
 			: null
 
-	// Внутренний номер (ext) - противоположный внешнему
-	let ext =
-		direction === 'inbound'
-			? callee_number
-			: direction === 'outbound'
-			? caller_number
-			: null
+	// Внутренний номер (ext) - стараемся получить именно extension
+	let ext = getInternalExtension(direction, {
+		caller_number,
+		callee_number,
+		caller_number_source,
+		callee_number_source,
+		caller_extension_number,
+		callee_extension_number,
+	})
 	
 	// Дополнительная проверка на внешний номер
 	const external =
@@ -138,7 +182,9 @@ const zoomThreadCallIn = async data => {
 	if (external) {
 		customerNumber = external
 		// Если external найден, ext - это противоположный номер
-		ext = external === caller_number ? callee_number : caller_number
+		if (!ext) {
+			ext = external === caller_number ? callee_number : caller_number
+		}
 	}
 
 	// callData можно хранить как угодно — просто пример
@@ -193,13 +239,36 @@ const zoomThreadCallIn = async data => {
 	try {
 		// Ищем заказы в коллекции fastQuiz в базе tvmount
 		const tvmountConn = await getTvmountConnection()
-		const UsersModel = tvmountConn.model("users", new mongoose.Schema({}, { strict: false }), "users")
-		const responsibleManager = await UsersModel.findOne({
-			extension_number:+ext
-		}) 
-		if(responsibleManager){
-			//TODO: Добавить ответственного менеджера в заказ
-			responsibleManagerId = responsibleManager.id
+		const UsersModel = tvmountConn.model(
+			'users',
+			new mongoose.Schema({}, { strict: false }),
+			'users'
+		)
+
+		const extDigits = normalizeDigits(ext)
+		const extForLookup = isLikelyExtension(extDigits) ? Number(extDigits) : null
+		const internalPartyId = getInternalPartyId(direction, {
+			caller_id,
+			callee_id,
+		})
+
+		let responsibleManager = null
+		if (extForLookup !== null) {
+			responsibleManager = await UsersModel.findOne({
+				extension_number: extForLookup,
+			})
+		}
+
+		if (!responsibleManager && internalPartyId) {
+			responsibleManager = await UsersModel.findOne({
+				id: internalPartyId,
+			})
+		}
+
+		if (!responsibleManager && extDigits && !isLikelyExtension(extDigits)) {
+			logger.warn(
+				`⚠️ ext "${ext}" не похож на extension, пропускаем поиск по extension_number`
+			)
 		}
 		const FastQuizModel = tvmountConn.model(
 			'fastQuiz',
@@ -230,7 +299,7 @@ const zoomThreadCallIn = async data => {
 		// Сохраняем звонок в базу данных
 		const callDataToSave = {
 			client_id: clientId,
-			ext: ext,
+			ext: String(ext),
 			direction: direction,
 			duration: duration,
 			result: result,

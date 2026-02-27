@@ -2,7 +2,11 @@ require('dotenv').config()
 const express = require('express')
 const app = express()
 const port = 8000
-const { queueConsumer } = require('./utils/queueConsumer')
+const isDev = process.env.NODE_ENV !== 'production'
+const devProcessingDelayMs = Number(
+	process.env.DEV_PROCESSING_DELAY_MS || 10000
+)
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const { zoomThreadCallIn } = require('./utils/zoom/zoomThreadCallIn')
 const { zoomThreadSmsIn } = require('./utils/zoom/zoomThreadSmsIn')
 
@@ -31,8 +35,6 @@ app.listen(port, async () => {
 
 	// Запускаем consumer для очереди
 	try {
-		await queueConsumer('call_in_test')
-
 		// Обработка SMS сообщений через отдельный consumer
 		const amqp = require('amqplib')
 		const url = `amqp://${process.env.RABBITMQ_USER}:${process.env.RABBITMQ_PASS}@${process.env.NGROK_TCP_HOST}:${process.env.NGROK_TCP_PORT}`
@@ -53,6 +55,9 @@ app.listen(port, async () => {
 			async message => {
 				if (message === null) return
 				try {
+					if (isDev && devProcessingDelayMs > 0) {
+						await sleep(devProcessingDelayMs)
+					}
 					const data = JSON.parse(message.content.toString())
 					await zoomThreadCallIn(data)
 					channelCall.ack(message)
@@ -70,6 +75,9 @@ app.listen(port, async () => {
 				if (message === null) return
 
 				try {
+					if (isDev && devProcessingDelayMs > 0) {
+						await sleep(devProcessingDelayMs)
+					}
 					const data = JSON.parse(message.content.toString())
 					await zoomThreadSmsIn(data)
 					chanelSms.ack(message)

@@ -1,6 +1,12 @@
 require('dotenv').config();
 const amqp = require('amqplib');
 
+const isDev = process.env.NODE_ENV !== 'production';
+const devProcessingDelayMs = Number(
+	process.env.DEV_PROCESSING_DELAY_MS || 1000
+);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 const queueConsumer = async (queueName) => {
     console.log('Queue consumer для очереди:', queueName);
     
@@ -39,6 +45,9 @@ const queueConsumer = async (queueName) => {
         throw error;
     }
     
+    // Ограничиваем количество одновременно обрабатываемых сообщений
+    await channel.prefetch(1);
+
     // Шаг 5: Подписываемся на сообщения из очереди
     console.log(`⏳ Ожидаем сообщения из очереди "${queueName}"...`);
     
@@ -50,6 +59,9 @@ const queueConsumer = async (queueName) => {
         }
         
         try {
+            if (isDev && devProcessingDelayMs > 0) {
+                await sleep(devProcessingDelayMs);
+            }
             // Парсим JSON сообщение
             const content = JSON.parse(message.content.toString());
             console.log('📨 Получено сообщение:', JSON.stringify(content, null, 2));
