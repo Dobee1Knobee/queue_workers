@@ -223,19 +223,18 @@ const zoomThreadCallIn = async data => {
 		logger.info(`✅ Создан новый клиент: id=${clientId}`)
 	}
 	
-	// Проверяем, не существует ли уже SMS или звонок с таким clientId
+	// Проверяем историю звонков и SMS для этого клиента
 	// Ленивая загрузка для избежания циклической зависимости
 	const { getSmsConnection } = require('./zoomThreadSmsIn')
 	const { model: smsModel } = await getSmsConnection()
 	const { model: callModel } = await getCallConnection()
 	
-	let existingSms = await smsModel.findOne({ clientId: clientId })
-	let existingCall = await callModel.findOne({ client_id: clientId })
+	const [existingSms, existingCall] = await Promise.all([
+		smsModel.findOne({ clientId: clientId }),
+		callModel.findOne({ client_id: clientId }),
+	])
 	
-	if (existingSms || existingCall) {
-		logger.info(`⚠️ SMS или Call с клиентом ${clientId} уже существует, пропускаем`)
-		return { success: true, skipped: true, message: 'SMS or Call already exists' }
-	}
+	logger.info(`🔍 История клиента ${clientId}: SMS=${!!existingSms}, Call=${!!existingCall}`)
 	
 	try {
 		// Ищем заказы в коллекции fastQuiz в базе tvmount
@@ -276,8 +275,13 @@ const zoomThreadCallIn = async data => {
 			new mongoose.Schema({}, { strict: false }),
 			'fastQuiz'
 		)
+		// Нормализуем номер для поиска: убираем все нецифровые, убираем ведущую 1
+		const digits10 = customerNumber.replace(/\D/g, '').replace(/^1/, '')
+		// Регекс для поиска номера в любом формате: +1 (248) 701-8182 или +12487018182
+		const phoneRegex = new RegExp(digits10.split('').join('[^0-9]*'))
+
 		const previewsOrder = await FastQuizModel.find({
-			client_id: clientId,
+			phone: { $regex: phoneRegex },
 		})
 
 		// Ищем заказы в коллекции quiz_submissions в базе tvmount
@@ -287,11 +291,12 @@ const zoomThreadCallIn = async data => {
 			'quiz_submissions'
 		)
 		const quizSubmission = await quizSubmissionModel.find({
-			client_id: clientId,
+			phone: { $regex: phoneRegex },
 		})
 
+		// Клиент повторный если: есть звонок/SMS или есть прошлые заказы
 		const hasExistingOrder =
-			previewsOrder.length > 0 || quizSubmission.length > 0
+			!!existingSms || !!existingCall || previewsOrder.length > 0 || quizSubmission.length > 0
 
 		logger.info(
 			`🔍 Найдено заказов: fastQuiz=${previewsOrder.length}, quiz_submissions=${quizSubmission.length}`

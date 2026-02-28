@@ -203,11 +203,15 @@ const zoomThreadSmsIn = async data => {
 			'quiz_submissions'
 		)
 
+		// Нормализуем номер для поиска в любом формате: +12487018182 или +1 (248) 701-8182
+		const digits10 = phoneNumber.replace(/\D/g, '').replace(/^1/, '')
+		const phoneRegex = new RegExp(digits10.split('').join('[^0-9]*'))
+
 		const [existingSms, existingCall, fastQuizOrders, quizSubmissions] = await Promise.all([
 			model.findOne({ clientId: clientId }),
 			callModel.findOne({ client_id: clientId }),
-			FastQuizModel.find({ client_id: clientId }),
-			QuizSubmissionModel.find({ client_id: clientId }),
+			FastQuizModel.find({ phone: { $regex: phoneRegex } }),
+			QuizSubmissionModel.find({ phone: { $regex: phoneRegex } }),
 		])
 
 		const allOrders = [...fastQuizOrders, ...quizSubmissions]
