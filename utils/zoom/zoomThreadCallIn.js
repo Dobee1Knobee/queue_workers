@@ -4,6 +4,7 @@ const logger = require('pino')()
 const { callSchema } = require('../../models/call_model')
 const { clientFinder, createNewClient } = require('../clientFinder')
 const axios = require('axios')
+const { sendToQueue } = require('../rabbitmq')
 
 let callConnection = null
 let CallModel = null
@@ -279,11 +280,11 @@ const zoomThreadCallIn = async data => {
 			client_id: clientId,
 		})
 
-		// Ищем заказы в коллекции quiz_submission в базе tvmount
+		// Ищем заказы в коллекции quiz_submissions в базе tvmount
 		const quizSubmissionModel = tvmountConn.model(
-			'quiz_submission',
+			'quiz_submissions',
 			new mongoose.Schema({}, { strict: false }),
-			'quiz_submission'
+			'quiz_submissions'
 		)
 		const quizSubmission = await quizSubmissionModel.find({
 			client_id: clientId,
@@ -293,7 +294,7 @@ const zoomThreadCallIn = async data => {
 			previewsOrder.length > 0 || quizSubmission.length > 0
 
 		logger.info(
-			`🔍 Найдено заказов: fastQuiz=${previewsOrder.length}, quiz_submission=${quizSubmission.length}`
+			`🔍 Найдено заказов: fastQuiz=${previewsOrder.length}, quiz_submissions=${quizSubmission.length}`
 		)
 
 		// Сохраняем звонок в базу данных
@@ -317,6 +318,20 @@ const zoomThreadCallIn = async data => {
 
 		if (hasExistingOrder) {
 			logger.info(`✅ Call сохранено (заказ уже существует): ${customerNumber}`)
+			
+			// Отправляем сообщение в RabbitMQ о повторном звонке
+			const repeatCallData = {
+				client_id: clientId,
+				customer_number: customerNumber,
+				orders: [...previewsOrder, ...quizSubmission],
+				direction: direction,
+				ext: ext,
+				duration: duration,
+				callEnd: callEndDate,
+				zoomData: data
+			}
+			
+			await sendToQueue('repeat_call_in', repeatCallData)
 		} else {
 			logger.info(
 				`✅ Первый заказ по ${direction} сохранен в базу данных: ${customerNumber}`

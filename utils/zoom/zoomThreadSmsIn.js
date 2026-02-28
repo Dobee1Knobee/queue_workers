@@ -4,6 +4,7 @@ const logger = require('pino')()
 const { smsSchema } = require('../../models/sms_model')
 const { clientFinder, createNewClient } = require('../clientFinder')
 const axios = require('axios')
+const { sendToQueue } = require('../rabbitmq')
 // Создаем отдельное подключение для SMS базы данных
 // чтобы избежать конфликтов с другими подключениями
 let smsConnection = null
@@ -188,105 +189,103 @@ const zoomThreadSmsIn = async data => {
 		// Ленивая загрузка для избежания циклической зависимости
 		const { getCallConnection } = require('./zoomThreadCallIn')
 		const { connection: callConnection, model: callModel } = await getCallConnection()
-		// Проверяем, не существует ли уже сообщение с таким messageId
-		let existingSms = null
-		let existingCall = null
-		
-		existingSms = await model.findOne({ clientId: clientId })
-		if (!existingSms) {
-			existingCall = await callModel.findOne({ client_id: clientId })
-		}
 
-		const shouldSkipFirstMessage = Boolean(existingSms || existingCall)
-		if (shouldSkipFirstMessage) {
-			logger.info(
-				`⚠️ SMS или Call с клиентом ${clientId} уже существует, не создаём заявку, но сохраняем SMS`
-			)
+		// Проверяем ВСЕ источники одновременно: SMS/Call история + fastQuiz + quiz_submissions
+		const tvmountConn = await getTvmountConnection()
+		const FastQuizModel = tvmountConn.model(
+			'fastQuiz',
+			new mongoose.Schema({}, { strict: false }),
+			'fastQuiz'
+		)
+		const QuizSubmissionModel = tvmountConn.model(
+			'quiz_submissions',
+			new mongoose.Schema({}, { strict: false }),
+			'quiz_submissions'
+		)
+
+		const [existingSms, existingCall, fastQuizOrders, quizSubmissions] = await Promise.all([
+			model.findOne({ clientId: clientId }),
+			callModel.findOne({ client_id: clientId }),
+			FastQuizModel.find({ client_id: clientId }),
+			QuizSubmissionModel.find({ client_id: clientId }),
+		])
+
+		const allOrders = [...fastQuizOrders, ...quizSubmissions]
+		const isRepeatCaller = Boolean(existingSms || existingCall || allOrders.length > 0)
+
+		logger.info(
+			`🔍 Проверка повторного клиента ${clientId}: SMS=${!!existingSms}, Call=${!!existingCall}, fastQuiz=${fastQuizOrders.length}, quiz_submissions=${quizSubmissions.length}`
+		)
+
+		if (isRepeatCaller) {
+			logger.info(`⚠️ Повторный клиент ${clientId} — отправляем уведомление в Telegram`)
 			isFirstMessage = false
-		}
 
-		if (!shouldSkipFirstMessage) {
-			// Ищем заказы в коллекции fastQuiz в базе tvmount
-			const tvmountConn = await getTvmountConnection()
-			const FastQuizModel = tvmountConn.model(
-				'fastQuiz',
-				new mongoose.Schema({}, { strict: false }),
-				'fastQuiz'
-			)
-			const previewsOrder = await FastQuizModel.find({
+			// Отправляем сообщение в RabbitMQ о повторном SMS
+			const repeatSmsData = {
 				client_id: clientId,
-			})
-			if (previewsOrder.length > 0) {
-				logger.info(`⚠️ Заказ уже существует`)
-				isFirstMessage = false
-			} else {
-				// quiz_submission также из базы tvmount
-				const quizSubmissionModel = tvmountConn.model(
-					'quiz_submission',
-					new mongoose.Schema({}, { strict: false }),
-					'quiz_submission'
-				)
-				const quizSubmission = await quizSubmissionModel.find({
-					client_id: clientId,
-				})
-				if (quizSubmission.length > 0) {
-					logger.info(`⚠️ Заказ уже существует`)
-					isFirstMessage = false
-				} else {
-					isFirstMessage = true
-					// URL webhook из переменной окружения или по умолчанию localhost:3000
-					const webhookUrl =
-						process.env.WEBHOOK_SMS_URL || 'http://localhost:3000/webhook/sms'
-					logger.info(`ЗАЯВКА ПО ПЕРВОМУ СООБЩЕНИЮ`)
-					axios
-						.post(
-							webhookUrl,
-							{
-								smsType: smsType,
-								isFirstMessage: isFirstMessage,
-								phone: phoneNumber,
-								clientId: clientId,
-								message: message,
-								messageId: messageId,
-								sessionId: sessionId,
-								ownerId: ownerId,
-								dateTime: dateTime,
-							},
-							{
-								headers: {
-									'Content-Type': 'application/json',
-								},
-							}
-						)
-						.then(response => {
-							logger.info(
-								`✅ SMS сохранено в базу данных: ${phoneNumber} - ${message.substring(
-									0,
-									50
-								)}...`
-							)
-						})
-						.catch(error => {
-							// Если сервер недоступен (ECONNREFUSED), это не критично - логируем как предупреждение
-							if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
-								logger.warn(
-									`⚠️ Webhook сервер недоступен (${error.config?.url}): ${error.message}. SMS сохранено в БД.`
-								)
-							} else {
-								// Другие ошибки логируем как ошибки
-								logger.error(
-									{
-										err: error,
-										message: error.message,
-										code: error.code,
-										url: error.config?.url,
-									},
-									'❌ Ошибка отправки webhook'
-								)
-							}
-						})
-				}
+				customer_number: phoneNumber,
+				orders: allOrders,
+				message: message,
+				smsType: smsType,
+				zoomData: data
 			}
+
+			await sendToQueue('repeat_sms_in', repeatSmsData)
+
+		} else {
+			isFirstMessage = true
+			// Новый клиент — отправляем webhook для создания заявки
+			const webhookUrl =
+				process.env.WEBHOOK_SMS_URL || 'http://localhost:3000/webhook/sms'
+			logger.info(`ЗАЯВКА ПО ПЕРВОМУ СООБЩЕНИЮ`)
+			axios
+				.post(
+					webhookUrl,
+					{
+						smsType: smsType,
+						isFirstMessage: isFirstMessage,
+						phone: phoneNumber,
+						clientId: clientId,
+						message: message,
+						messageId: messageId,
+						sessionId: sessionId,
+						ownerId: ownerId,
+						dateTime: dateTime,
+					},
+					{
+						headers: {
+							'Content-Type': 'application/json',
+						},
+					}
+				)
+				.then(response => {
+					logger.info(
+						`✅ SMS сохранено в базу данных: ${phoneNumber} - ${message.substring(
+							0,
+							50
+						)}...`
+					)
+				})
+				.catch(error => {
+					// Если сервер недоступен (ECONNREFUSED), это не критично - логируем как предупреждение
+					if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
+						logger.warn(
+							`⚠️ Webhook сервер недоступен (${error.config?.url}): ${error.message}. SMS сохранено в БД.`
+						)
+					} else {
+						// Другие ошибки логируем как ошибки
+						logger.error(
+							{
+								err: error,
+								message: error.message,
+								code: error.code,
+								url: error.config?.url,
+							},
+							'❌ Ошибка отправки webhook'
+						)
+					}
+				})
 		}
 
 		// Создаём новую запись SMS
