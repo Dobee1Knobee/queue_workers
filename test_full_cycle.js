@@ -71,9 +71,10 @@ async function runTest() {
   // --- Шаг 4: Публикуем в RabbitMQ если повторный ---
   if (isRepeat) {
     const payload = {
-      client_id: clientId,
-      customer_number: customerNumber,
-      orders: allOrders.map(o => ({ city: o.city, state: o.state, tvCount: o.tvCount || '?' })),
+      client_id: "60a12345b12345c12345d123", // Fake ObjectId
+      client_numeric_id: 41381, // Real client ID from user's logs
+      customer_number: '12487018182',
+      orders: [], // button_bot.py ignores this now and queries DB
       direction: 'inbound',
       test: true
     }

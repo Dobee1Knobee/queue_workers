@@ -214,32 +214,22 @@ const zoomThreadCallIn = async data => {
 
 	const client = await clientFinder(customerNumber)
 	let clientId = null
+	let clientNumericId = null
 	if (client) {
 		clientId = client.id
-		logger.info(`✅ Клиент найден: id=${clientId}`)
+		clientNumericId = Number(client.toObject().id) || client.toObject().id // числовой id для кнопки Claim
+		logger.info(`✅ Клиент найден: id=${clientId}, numericId=${clientNumericId}`)
 	} else {
 		const newClient = await createNewClient(customerNumber)
 		clientId = newClient.id
-		logger.info(`✅ Создан новый клиент: id=${clientId}`)
+		clientNumericId = Number(newClient.toObject().id) || newClient.toObject().id
+		logger.info(`✅ Создан новый клиент: id=${clientId}, numericId=${clientNumericId}`)
 	}
-	
-	// Проверяем историю звонков и SMS для этого клиента
-	// Ленивая загрузка для избежания циклической зависимости
-	const { getSmsConnection } = require('./zoomThreadSmsIn')
-	const { model: smsModel } = await getSmsConnection()
-	const { model: callModel } = await getCallConnection()
-	
-	const [existingSms, existingCall] = await Promise.all([
-		smsModel.findOne({ clientId: clientId }),
-		callModel.findOne({ client_id: clientId }),
-	])
-	
-	logger.info(`🔍 История клиента ${clientId}: SMS=${!!existingSms}, Call=${!!existingCall}`)
 	
 	try {
 		// Ищем заказы в коллекции fastQuiz в базе tvmount
 		const tvmountConn = await getTvmountConnection()
-		const UsersModel = tvmountConn.model(
+		const UsersModel = tvmountConn.models.users || tvmountConn.model(
 			'users',
 			new mongoose.Schema({}, { strict: false }),
 			'users'
@@ -270,36 +260,30 @@ const zoomThreadCallIn = async data => {
 				`⚠️ ext "${ext}" не похож на extension, пропускаем поиск по extension_number`
 			)
 		}
-		const FastQuizModel = tvmountConn.model(
-			'fastQuiz',
+		// Ищем заказы в коллекции orders в базе tvmount за последние 2 недели
+		const OrdersModel = tvmountConn.models.orders || tvmountConn.model(
+			'orders',
 			new mongoose.Schema({}, { strict: false }),
-			'fastQuiz'
+			'orders'
 		)
-		// Нормализуем номер для поиска: убираем все нецифровые, убираем ведущую 1
-		const digits10 = customerNumber.replace(/\D/g, '').replace(/^1/, '')
-		// Регекс для поиска номера в любом формате: +1 (248) 701-8182 или +12487018182
-		const phoneRegex = new RegExp(digits10.split('').join('[^0-9]*'))
 
-		const previewsOrder = await FastQuizModel.find({
-			phone: { $regex: phoneRegex },
-		})
+		const twoWeeksAgo = new Date();
+		twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
+		const twoWeeksAgoId = new mongoose.Types.ObjectId(
+			Math.floor(twoWeeksAgo.getTime() / 1000).toString(16) + '0000000000000000'
+		);
 
-		// Ищем заказы в коллекции quiz_submissions в базе tvmount
-		const quizSubmissionModel = tvmountConn.model(
-			'quiz_submissions',
-			new mongoose.Schema({}, { strict: false }),
-			'quiz_submissions'
-		)
-		const quizSubmission = await quizSubmissionModel.find({
-			phone: { $regex: phoneRegex },
-		})
+		// Запрашиваем из базы заказы за последние 2 недели
+		const recentOrders = await OrdersModel.find({ 
+			client_id: clientNumericId,
+			_id: { $gte: twoWeeksAgoId }
+		}).sort({ _id: -1 }).limit(10);
 
-		// Клиент повторный если: есть звонок/SMS или есть прошлые заказы
-		const hasExistingOrder =
-			!!existingSms || !!existingCall || previewsOrder.length > 0 || quizSubmission.length > 0
+		// По ТЗ: "была ли за последние 2 недели запись в таблице хендимен с таким client_id"
+		const hasExistingOrder = recentOrders.length > 0;
 
 		logger.info(
-			`🔍 Найдено заказов: fastQuiz=${previewsOrder.length}, quiz_submissions=${quizSubmission.length}`
+			`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}`
 		)
 
 		// Сохраняем звонок в базу данных
@@ -327,8 +311,9 @@ const zoomThreadCallIn = async data => {
 			// Отправляем сообщение в RabbitMQ о повторном звонке
 			const repeatCallData = {
 				client_id: clientId,
+				client_numeric_id: clientNumericId, // числовой id для кнопки Claim (#c12345)
 				customer_number: customerNumber,
-				orders: [...previewsOrder, ...quizSubmission],
+				orders: recentOrders,
 				direction: direction,
 				ext: ext,
 				duration: duration,

@@ -158,16 +158,19 @@ const zoomThreadSmsIn = async data => {
 		// Ищем клиента по номеру телефона
 		let client = await clientFinder(phoneNumber)
 		let clientId = null
+		let clientNumericId = null
 
 		if (client) {
 			// Клиент найден, используем его id
 			clientId = client.id
+			clientNumericId = client.toObject().id // числовой id для кнопки Claim
 		} else {
 			// Клиент не найден, создаем нового
 			const newClient = await createNewClient(phoneNumber)
 			clientId = newClient.id
+			clientNumericId = newClient.toObject().id
 			logger.info(
-				`✅ Создан новый клиент с id: ${clientId} для номера: ${phoneNumber}`
+				`✅ Создан новый клиент с id: ${clientId}, numericId: ${clientNumericId} для номера: ${phoneNumber}`
 			)
 		}
 		const message = smsData.message || ''
@@ -186,50 +189,44 @@ const zoomThreadSmsIn = async data => {
 
 		// Получаем подключение и модель
 		const { connection, model } = await getSmsConnection()
-		// Ленивая загрузка для избежания циклической зависимости
-		const { getCallConnection } = require('./zoomThreadCallIn')
-		const { connection: callConnection, model: callModel } = await getCallConnection()
 
-		// Проверяем ВСЕ источники одновременно: SMS/Call история + fastQuiz + quiz_submissions
+		// Ищем заказы в коллекции orders в базе tvmount за последние 2 недели
 		const tvmountConn = await getTvmountConnection()
-		const FastQuizModel = tvmountConn.model(
-			'fastQuiz',
+		const OrdersModel = tvmountConn.models.orders || tvmountConn.model(
+			'orders',
 			new mongoose.Schema({}, { strict: false }),
-			'fastQuiz'
-		)
-		const QuizSubmissionModel = tvmountConn.model(
-			'quiz_submissions',
-			new mongoose.Schema({}, { strict: false }),
-			'quiz_submissions'
+			'orders'
 		)
 
-		// Нормализуем номер для поиска в любом формате: +12487018182 или +1 (248) 701-8182
-		const digits10 = phoneNumber.replace(/\D/g, '').replace(/^1/, '')
-		const phoneRegex = new RegExp(digits10.split('').join('[^0-9]*'))
+		const twoWeeksAgo = new Date();
+		twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
+		const twoWeeksAgoId = new mongoose.Types.ObjectId(
+			Math.floor(twoWeeksAgo.getTime() / 1000).toString(16) + '0000000000000000'
+		);
 
-		const [existingSms, existingCall, fastQuizOrders, quizSubmissions] = await Promise.all([
-			model.findOne({ clientId: clientId }),
-			callModel.findOne({ client_id: clientId }),
-			FastQuizModel.find({ phone: { $regex: phoneRegex } }),
-			QuizSubmissionModel.find({ phone: { $regex: phoneRegex } }),
-		])
+		// Запрашиваем из базы заказы за последние 2 недели
+		const recentOrders = await OrdersModel.find({
+			client_id: clientNumericId,
+			_id: { $gte: twoWeeksAgoId }
+		}).sort({ _id: -1 }).limit(10);
 
-		const allOrders = [...fastQuizOrders, ...quizSubmissions]
-		const isRepeatCaller = Boolean(existingSms || existingCall || allOrders.length > 0)
+		// По ТЗ: "была ли за последние 2 недели запись в таблице хендимен с таким client_id"
+		const hasExistingOrder = recentOrders.length > 0;
 
 		logger.info(
-			`🔍 Проверка повторного клиента ${clientId}: SMS=${!!existingSms}, Call=${!!existingCall}, fastQuiz=${fastQuizOrders.length}, quiz_submissions=${quizSubmissions.length}`
+			`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}`
 		)
 
-		if (isRepeatCaller) {
+		if (hasExistingOrder) {
 			logger.info(`⚠️ Повторный клиент ${clientId} — отправляем уведомление в Telegram`)
 			isFirstMessage = false
 
 			// Отправляем сообщение в RabbitMQ о повторном SMS
 			const repeatSmsData = {
 				client_id: clientId,
+				client_numeric_id: clientNumericId, // числовой id для кнопки Claim (#c12345)
 				customer_number: phoneNumber,
-				orders: allOrders,
+				orders: recentOrders,
 				message: message,
 				smsType: smsType,
 				zoomData: data
