@@ -278,7 +278,12 @@ async def handle_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client_ref = clients_db.find_one({"id": client_id}) if client_id else None
     phone = form.get("telephone", "_")
     client_name = (client_ref or {}).get("client_name", "_") if client_ref else "_"
-    sms_line = f"\n\n💬 Текст СМС:\n{form.get('sms_text')}" if form.get("sms_text") else ""
+    sms_raw = form.get("sms_text", "")
+    if sms_raw:
+        sms_text = sms_raw.replace("\\n", "\n")
+        sms_line = f"\n\n💬 Текст СМС:\n{sms_text}"
+    else:
+        sms_line = ""
 
     try:
         await context.bot.send_message(
