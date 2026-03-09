@@ -137,6 +137,10 @@ const getClientPhoneFromSms = (event, smsData) => {
 	return null
 }
 
+// Dedup: skip repeat notifications for the same client within 10 minutes
+const recentRepeatClients = new Map()
+const REPEAT_DEDUP_MS = 3 * 60 * 1000
+
 const zoomThreadSmsIn = async data => {
 	logger.info('📱 Обработка SMS сообщения')
 
@@ -217,22 +221,30 @@ const zoomThreadSmsIn = async data => {
 			`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}`
 		)
 
-		if (hasExistingOrder) {
-			logger.info(`⚠️ Повторный клиент ${clientId} — отправляем уведомление в Telegram`)
+		if (hasExistingOrder && smsType === 'incoming') {
+			logger.info(`⚠️ Повторный клиент ${clientId} — входящее SMS, отправляем уведомление в Telegram`)
 			isFirstMessage = false
 
-			// Отправляем сообщение в RabbitMQ о повторном SMS
-			const repeatSmsData = {
-				client_id: clientId,
-				client_numeric_id: clientNumericId, // числовой id для кнопки Claim (#c12345)
-				customer_number: phoneNumber,
-				orders: recentOrders,
-				message: message,
-				smsType: smsType,
-				zoomData: data
-			}
+			// Dedup: skip if we already sent repeat for this client recently
+			const dedupKey = `sms_${clientNumericId}`
+			const lastSent = recentRepeatClients.get(dedupKey)
+			if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+				logger.info(`⏭️ Дедупликация: repeat_sms_in для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`)
+			} else {
+				recentRepeatClients.set(dedupKey, Date.now())
 
-			await sendToQueue('repeat_sms_in', repeatSmsData)
+				const repeatSmsData = {
+					client_id: clientId,
+					client_numeric_id: clientNumericId,
+					customer_number: phoneNumber,
+					orders: recentOrders,
+					message: message,
+					smsType: smsType,
+					zoomData: data
+				}
+
+				await sendToQueue('repeat_sms_in', repeatSmsData)
+			}
 
 		} else {
 			isFirstMessage = true

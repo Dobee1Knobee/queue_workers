@@ -11,4 +11,6 @@ services:
       context: .
       dockerfile: Dockerfile.minibot
     env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
     restart: unless-stopped

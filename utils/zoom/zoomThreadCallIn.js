@@ -127,6 +127,10 @@ const getCallConnection = async () => {
 	CallModel = callConnection.model('Call', callSchema, 'call')
 	return { connection: callConnection, model: CallModel }
 }
+// Dedup: skip repeat notifications for the same client within 10 minutes
+const recentRepeatClients = new Map()
+const REPEAT_DEDUP_MS = 3 * 60 * 1000
+
 const zoomThreadCallIn = async data => {
 	logger.info('📞 Обработка Call сообщения')
 
@@ -305,23 +309,32 @@ const zoomThreadCallIn = async data => {
 
 		logger.info(`✅ Call успешно сохранен в БД с _id: ${call._id}`)
 
-		if (hasExistingOrder) {
-			logger.info(`✅ Call сохранено (заказ уже существует): ${customerNumber}`)
-			
-			// Отправляем сообщение в RabbitMQ о повторном звонке
-			const repeatCallData = {
-				client_id: clientId,
-				client_numeric_id: clientNumericId, // числовой id для кнопки Claim (#c12345)
-				customer_number: customerNumber,
-				orders: recentOrders,
-				direction: direction,
-				ext: ext,
-				duration: duration,
-				callEnd: callEndDate,
-				zoomData: data
+		if (hasExistingOrder && direction === 'inbound') {
+			logger.info(`✅ Call сохранено (заказ уже существует, входящий): ${customerNumber}`)
+
+			// Dedup: skip if we already sent repeat for this client recently
+			const dedupKey = `call_${clientNumericId}`
+			const lastSent = recentRepeatClients.get(dedupKey)
+			if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+				logger.info(`⏭️ Дедупликация: repeat_call_in для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`)
+			} else {
+				recentRepeatClients.set(dedupKey, Date.now())
+
+				// Отправляем сообщение в RabbitMQ о повторном звонке
+				const repeatCallData = {
+					client_id: clientId,
+					client_numeric_id: clientNumericId,
+					customer_number: customerNumber,
+					orders: recentOrders,
+					direction: direction,
+					ext: ext,
+					duration: duration,
+					callEnd: callEndDate,
+					zoomData: data
+				}
+
+				await sendToQueue('repeat_call_in', repeatCallData)
 			}
-			
-			await sendToQueue('repeat_call_in', repeatCallData)
 		} else {
 			logger.info(
 				`✅ Первый заказ по ${direction} сохранен в базу данных: ${customerNumber}`
