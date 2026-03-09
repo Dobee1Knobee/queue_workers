@@ -1,0 +1,421 @@
+require('dotenv').config()
+const axios = require('axios')
+const crypto = require('node:crypto')
+const mongoose = require('mongoose')
+const logger = require('pino')()
+const { sendToQueue } = require('./rabbitmq')
+
+let tvmountConnection = null
+
+const GATEWAY_ENABLED = String(
+	process.env.TELEGRAM_GATEWAY_ENABLED || 'false'
+).toLowerCase() === 'true'
+const GATEWAY_URL = (
+	process.env.TELEGRAM_GATEWAY_URL || 'https://telegram.it.tvmountmaster.com'
+).replace(/\/+$/, '')
+const GATEWAY_CALLER_ID = process.env.TELEGRAM_GATEWAY_CALLER_ID || ''
+const GATEWAY_API_KEY = process.env.TELEGRAM_GATEWAY_API_KEY || ''
+const GATEWAY_CHAT_ID = process.env.TELEGRAM_GATEWAY_CHAT_ID || process.env.TELEGRAM_CHAT_ID || ''
+const GATEWAY_CHAT_ALIAS = process.env.TELEGRAM_GATEWAY_CHAT_ALIAS || ''
+const EXPECTED_APP_KEY = process.env.TELEGRAM_GATEWAY_EXPECTED_APP_KEY || ''
+const EXPECTED_ROUTE_KEY = process.env.TELEGRAM_GATEWAY_EXPECTED_ROUTE_KEY || ''
+
+const isGatewayEnabled = () => GATEWAY_ENABLED
+
+const normalizeClientId = clientId => {
+	if (clientId === null || clientId === undefined) return null
+	if (typeof clientId === 'object' && clientId.$numberLong) {
+		const parsed = Number(clientId.$numberLong)
+		return Number.isFinite(parsed) ? parsed : null
+	}
+	const parsed = Number(clientId)
+	return Number.isFinite(parsed) ? parsed : null
+}
+
+const getOrderId = order => {
+	if (!order) return null
+	if (typeof order.get === 'function') {
+		return order.get('order_id')
+	}
+	return order.order_id || null
+}
+
+const formatUtcIso = date => date.toISOString().replace(/\.\d{3}Z$/, 'Z')
+
+const getGatewayChatTarget = () => {
+	if (GATEWAY_CHAT_ALIAS) return { chatAlias: GATEWAY_CHAT_ALIAS }
+	if (GATEWAY_CHAT_ID) return { chatId: String(GATEWAY_CHAT_ID) }
+	throw new Error(
+		'TELEGRAM_GATEWAY_CHAT_ID/TELEGRAM_CHAT_ID or TELEGRAM_GATEWAY_CHAT_ALIAS must be configured'
+	)
+}
+
+const makeIdempotencyKey = prefix =>
+	`${prefix}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`
+
+const getTvmountConnection = async () => {
+	if (tvmountConnection && tvmountConnection.readyState === 1) {
+		return tvmountConnection
+	}
+
+	let dbUrl = process.env.TVMOUNT_DB_URL || process.env.CLIENTS_DB_URL
+	if (!dbUrl && process.env.CALL_DB_URL) {
+		dbUrl = process.env.CALL_DB_URL.replace(/\/[^\/\?]+(\?|$)/, '/tvmount$1')
+	}
+	if (!dbUrl && process.env.SMS_DB_URL) {
+		dbUrl = process.env.SMS_DB_URL.replace(/\/[^\/\?]+(\?|$)/, '/tvmount$1')
+	}
+	if (!dbUrl) {
+		throw new Error(
+			'TVMOUNT_DB_URL/CLIENTS_DB_URL/CALL_DB_URL/SMS_DB_URL is not configured'
+		)
+	}
+
+	tvmountConnection = mongoose.createConnection(dbUrl, {
+		bufferCommands: false,
+		maxPoolSize: 10,
+	})
+
+	await new Promise((resolve, reject) => {
+		if (tvmountConnection.readyState === 1) {
+			logger.info('✅ Connected to tvmount database (gateway flow)')
+			resolve()
+			return
+		}
+		tvmountConnection.once('connected', () => {
+			logger.info('✅ Connected to tvmount database (gateway flow)')
+			resolve()
+		})
+		tvmountConnection.once('error', err => reject(err))
+	})
+
+	return tvmountConnection
+}
+
+const getCollectionModel = async name => {
+	const conn = await getTvmountConnection()
+	return conn.models[name] || conn.model(name, new mongoose.Schema({}, { strict: false }), name)
+}
+
+const gatewayPostInternal = async ({ operationType, payload, idempotencyKey, correlationId }) => {
+	if (!GATEWAY_CALLER_ID || !GATEWAY_API_KEY) {
+		throw new Error(
+			'TELEGRAM_GATEWAY_CALLER_ID and TELEGRAM_GATEWAY_API_KEY must be configured'
+		)
+	}
+
+	const requestBody = {
+		idempotencyKey: idempotencyKey || makeIdempotencyKey(operationType),
+		operationType,
+		payload,
+	}
+
+	const headers = {
+		'x-caller-id': GATEWAY_CALLER_ID,
+		'x-internal-api-key': GATEWAY_API_KEY,
+		'x-correlation-id': correlationId || crypto.randomUUID(),
+		'content-type': 'application/json',
+	}
+
+	try {
+		const resp = await axios.post(
+			`${GATEWAY_URL}/v1/internal/telegram-requests`,
+			requestBody,
+			{
+				headers,
+				timeout: 12000,
+				validateStatus: () => true,
+			}
+		)
+		if (resp.status < 200 || resp.status >= 300) {
+			throw new Error(
+				`Gateway internal request failed: ${resp.status} ${JSON.stringify(resp.data || {})}`
+			)
+		}
+		return resp.data
+	} catch (error) {
+		const details = error.response
+			? `${error.response.status} ${JSON.stringify(error.response.data || {})}`
+			: error.message
+		throw new Error(`Gateway request error: ${details}`)
+	}
+}
+
+const safeAnswerCallback = async (callbackQueryId, text, showAlert = false) => {
+	if (!callbackQueryId) return
+	try {
+		await gatewayPostInternal({
+			operationType: 'answer_callback_query',
+			idempotencyKey: makeIdempotencyKey(`answer-callback-${callbackQueryId}`),
+			payload: {
+				callbackQueryId,
+				...(text ? { text } : {}),
+				...(showAlert ? { showAlert: true } : {}),
+			},
+		})
+	} catch (error) {
+		logger.warn(`⚠️ Failed to answer callback query ${callbackQueryId}: ${error.message}`)
+	}
+}
+
+const buildRepeatMessage = ({ type, clientNumericId, recentOrders }) => {
+	let orderIdsText = ''
+	for (const order of recentOrders || []) {
+		const orderId = getOrderId(order)
+		if (orderId) orderIdsText += `\n  📦 ${orderId}`
+	}
+	const orderBlock = orderIdsText ? `\n\n📋 Прошлые заказы:${orderIdsText}` : ''
+
+	if (type === 'call') {
+		return `📞 Повторный звонок\nКлиент: #c${clientNumericId}${orderBlock}`
+	}
+	return `💬 Повторное СМС\nКлиент: #c${clientNumericId}${orderBlock}`
+}
+
+const sendRepeatNotificationToGateway = async ({ type, repeatData }) => {
+	const clientNumericId = repeatData.client_numeric_id || repeatData.client_id
+	const customerNumber = repeatData.customer_number || ''
+	const messageText = repeatData.message || ''
+	const recentOrders = repeatData.orders || []
+	const text = buildRepeatMessage({ type, clientNumericId, recentOrders })
+
+	const sendResp = await gatewayPostInternal({
+		operationType: 'send_message',
+		idempotencyKey: makeIdempotencyKey(`repeat-${type}-${clientNumericId}`),
+		payload: {
+			...getGatewayChatTarget(),
+			text,
+			replyMarkup: {
+				inlineKeyboard: [[{ text: 'Claim', callbackData: `claim:${clientNumericId}` }]],
+			},
+		},
+	})
+
+	const telegramMessageId = sendResp?.deliveryResult?.messageId
+	const telegramChatId = sendResp?.deliveryResult?.chatId
+	if (!telegramMessageId) {
+		logger.warn(
+			`⚠️ Gateway send_message accepted without deliveryResult.messageId (type=${type}, client=${clientNumericId})`
+		)
+		return sendResp
+	}
+
+	const FilledFormsModel = await getCollectionModel('filled_forms')
+	await FilledFormsModel.create({
+		chat_team: 'TEST',
+		team_: 'test_gateway',
+		cpmn_name: type === 'call' ? 'repeat_call' : 'repeat_sms',
+		client_id: clientNumericId,
+		telephone: customerNumber,
+		...(type === 'sms' ? { sms_text: messageText } : {}),
+		chat_message_id: telegramMessageId,
+		test_chat_id: telegramChatId || GATEWAY_CHAT_ID || null,
+		date: formatUtcIso(new Date()),
+		text,
+		type: 'TV',
+		messages: {},
+		source: 'telegram_gateway',
+	})
+
+	return sendResp
+}
+
+const sendRepeatCallNotification = repeatData =>
+	sendRepeatNotificationToGateway({ type: 'call', repeatData })
+
+const sendRepeatSmsNotification = repeatData =>
+	sendRepeatNotificationToGateway({ type: 'sms', repeatData })
+
+const extractGatewayCallback = payload => {
+	const callbackQuery = payload?.callbackQuery || payload?.rawUpdate?.callback_query || {}
+	const callbackMessage =
+		callbackQuery.message || payload?.rawUpdate?.callback_query?.message || {}
+	const callbackFrom = callbackQuery.from || payload?.rawUpdate?.callback_query?.from || {}
+
+	return {
+		callbackQueryId: callbackQuery.id || null,
+		callbackData: callbackQuery.data || null,
+		messageId: callbackQuery.messageId || callbackMessage.message_id || null,
+		chatId:
+			callbackMessage?.chatId ||
+			callbackMessage?.chat?.id ||
+			payload?.message?.chatId ||
+			null,
+		fromId: callbackQuery.fromId || callbackFrom.id || null,
+		username: callbackFrom.username || null,
+		firstName: callbackFrom.first_name || null,
+	}
+}
+
+const formatClaimDm = ({ form, clientRef }) => {
+	const phone = form?.telephone || '_'
+	const clientName = clientRef?.client_name || '_'
+	const smsRaw = form?.sms_text || ''
+	const smsText = smsRaw ? `\n\n💬 Текст СМС:\n${String(smsRaw).replace(/\\n/g, '\n')}` : ''
+	return (
+		`Client #c${form?.client_id ?? '_'}\n` +
+		`Client name: ${clientName}\n` +
+		`Campaign: ${form?.cpmn_name ?? '_'}\n` +
+		`Phone: ${phone}${smsText}`
+	)
+}
+
+const handleGatewayTelegramEvent = async payload => {
+	const updateType = payload?.updateType || 'unknown'
+	if (updateType !== 'callback_query') {
+		return { handled: false, reason: `ignored updateType=${updateType}` }
+	}
+
+	const callback = extractGatewayCallback(payload)
+	if (!callback.callbackData || !callback.callbackData.startsWith('claim:')) {
+		return { handled: false, reason: 'ignored non-claim callback' }
+	}
+
+	const messageId = Number(callback.messageId)
+	if (!Number.isFinite(messageId)) {
+		await safeAnswerCallback(callback.callbackQueryId, 'Invalid message', true)
+		return { handled: true, reason: 'invalid messageId' }
+	}
+
+	const FilledFormsModel = await getCollectionModel('filled_forms')
+	const UsersModel = await getCollectionModel('users')
+	const ClientsModel = await getCollectionModel('clients')
+
+	const form = await FilledFormsModel.findOne({
+		$or: [{ chat_message_id: messageId }, { chat_message_id: String(messageId) }],
+	})
+
+	if (!form) {
+		await safeAnswerCallback(callback.callbackQueryId, 'Form not found', true)
+		return { handled: true, reason: 'form not found' }
+	}
+
+	if (form.manager_at) {
+		await safeAnswerCallback(callback.callbackQueryId, 'Already claimed!', true)
+		return { handled: true, reason: 'already claimed' }
+	}
+
+	await safeAnswerCallback(callback.callbackQueryId)
+
+	const username = callback.username || callback.firstName || `id_${callback.fromId || 'unknown'}`
+
+	let user = null
+	if (callback.username) {
+		user = await UsersModel.findOne({ at: callback.username })
+	}
+	if (!user && callback.fromId !== null && callback.fromId !== undefined) {
+		user = await UsersModel.findOne({
+			$or: [{ chat_id: callback.fromId }, { chat_id: String(callback.fromId) }],
+		})
+	}
+
+	const managerId = user?.manager_id || 'T0'
+	const team = user?.team || 'TEST'
+	const managerAt = user?.at || username
+
+	await FilledFormsModel.updateOne(
+		{ _id: form._id },
+		{
+			$set: {
+				team,
+				manager_id: managerId,
+				manager_at: managerAt,
+			},
+		}
+	)
+
+	const chatId = callback.chatId || form.test_chat_id || GATEWAY_CHAT_ID
+	if (chatId) {
+		const updatedText = `claimed by @${username} #${managerId}${team}\n${form.text || ''}`
+		try {
+			await gatewayPostInternal({
+				operationType: 'edit_message_text',
+				idempotencyKey: makeIdempotencyKey(`claim-edit-${messageId}`),
+				payload: {
+					chatId: String(chatId),
+					messageId,
+					text: updatedText,
+				},
+			})
+		} catch (error) {
+			logger.warn(`⚠️ Failed to edit claimed message ${messageId}: ${error.message}`)
+		}
+	}
+
+	const clientId = normalizeClientId(form.client_id)
+	let clientRef = null
+	if (clientId !== null) {
+		clientRef = await ClientsModel.findOne({
+			$or: [{ id: clientId }, { id: String(clientId) }],
+		})
+	}
+
+	const claimerChatId = user?.chat_id || callback.fromId
+	if (claimerChatId) {
+		try {
+			await gatewayPostInternal({
+				operationType: 'send_message',
+				idempotencyKey: makeIdempotencyKey(`claim-dm-${form._id}`),
+				payload: {
+					chatId: String(claimerChatId),
+					text: formatClaimDm({ form, clientRef }),
+				},
+			})
+		} catch (error) {
+			logger.warn(
+				`⚠️ Failed to send DM for claim form=${form._id} chatId=${claimerChatId}: ${error.message}`
+			)
+		}
+	}
+
+	if (clientId !== null) {
+		const utcNow = new Date()
+		const shiftStart = new Date(utcNow)
+		if (utcNow.getUTCHours() >= 4) {
+			shiftStart.setUTCHours(0, 0, 0, 0)
+		} else {
+			shiftStart.setUTCDate(shiftStart.getUTCDate() - 1)
+			shiftStart.setUTCHours(0, 0, 0, 0)
+		}
+
+		await sendToQueue('personal_claimed_leads', {
+			shift_date: shiftStart.toISOString().slice(0, 10),
+			client_id: clientId,
+			manager_at: managerAt,
+			team,
+			form_id: String(form._id),
+			form_date: form.date,
+			claim_date: formatUtcIso(utcNow),
+			event: 'claim',
+		})
+	}
+
+	logger.info(`✅ [gateway-claim] @${username} claimed #c${form.client_id}`)
+	return { handled: true, reason: 'claim processed', formId: String(form._id) }
+}
+
+const verifyGatewayEventHeaders = headers => {
+	if (EXPECTED_APP_KEY && headers['x-telegram-app-key'] !== EXPECTED_APP_KEY) {
+		return {
+			valid: false,
+			status: 403,
+			message: `Unexpected x-telegram-app-key: ${headers['x-telegram-app-key'] || ''}`,
+		}
+	}
+	if (EXPECTED_ROUTE_KEY && headers['x-telegram-route-key'] !== EXPECTED_ROUTE_KEY) {
+		return {
+			valid: false,
+			status: 403,
+			message: `Unexpected x-telegram-route-key: ${headers['x-telegram-route-key'] || ''}`,
+		}
+	}
+	return { valid: true }
+}
+
+module.exports = {
+	isGatewayEnabled,
+	sendRepeatCallNotification,
+	sendRepeatSmsNotification,
+	handleGatewayTelegramEvent,
+	verifyGatewayEventHeaders,
+}

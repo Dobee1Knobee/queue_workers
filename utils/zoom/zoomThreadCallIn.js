@@ -3,8 +3,11 @@ const mongoose = require('mongoose')
 const logger = require('pino')()
 const { callSchema } = require('../../models/call_model')
 const { clientFinder, createNewClient } = require('../clientFinder')
-const axios = require('axios')
 const { sendToQueue } = require('../rabbitmq')
+const {
+	isGatewayEnabled,
+	sendRepeatCallNotification,
+} = require('../gatewayFlow')
 
 let callConnection = null
 let CallModel = null
@@ -309,8 +312,8 @@ const zoomThreadCallIn = async data => {
 
 		logger.info(`✅ Call успешно сохранен в БД с _id: ${call._id}`)
 
-		if (hasExistingOrder && direction === 'inbound') {
-			logger.info(`✅ Call сохранено (заказ уже существует, входящий): ${customerNumber}`)
+			if (hasExistingOrder && direction === 'inbound') {
+				logger.info(`✅ Call сохранено (заказ уже существует, входящий): ${customerNumber}`)
 
 			// Dedup: skip if we already sent repeat for this client recently
 			const dedupKey = `call_${clientNumericId}`
@@ -333,59 +336,30 @@ const zoomThreadCallIn = async data => {
 					zoomData: data
 				}
 
-				await sendToQueue('repeat_call_in', repeatCallData)
-			}
-		} else {
-			logger.info(
-				`✅ Первый заказ по ${direction} сохранен в базу данных: ${customerNumber}`
-			)
-			
-			// Отправляем webhook для первой заявки
-			const webhookUrl = process.env.WEBHOOK_CALL_URL || process.env.WEBHOOK_SMS_URL || 'http://localhost:3000/webhook/call'
-			logger.info(`📞 ЗАЯВКА ПО ПЕРВОМУ ЗВОНКУ`)
-			axios
-				.post(
-					webhookUrl,
-					{
-						type: 'call',
-						direction: direction,
-						phone: customerNumber,
-						clientId: clientId,
-						ext: ext,
-						duration: duration,
-						result: result,
-						callEndTime: callEndDate,
-						isFirstMessage: true,
-					},
-					{
-						headers: {
-							'Content-Type': 'application/json',
-						},
-					}
-				)
-				.then(response => {
-					logger.info(`✅ Webhook отправлен успешно для звонка: ${customerNumber}`)
-				})
-				.catch(error => {
-					// Если сервер недоступен (ECONNREFUSED), это не критично - логируем как предупреждение
-					if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
-						logger.warn(
-							`⚠️ Webhook сервер недоступен (${error.config?.url}): ${error.message}. Call сохранен в БД.`
-						)
+					if (isGatewayEnabled()) {
+						try {
+							await sendRepeatCallNotification(repeatCallData)
+							logger.info(
+								`✅ repeat_call_in отправлен через Telegram Gateway (client=${clientNumericId})`
+							)
+						} catch (gatewayError) {
+							logger.error(
+								`❌ Ошибка Telegram Gateway для repeat_call_in: ${gatewayError.message}`
+							)
+							await sendToQueue('repeat_call_in', repeatCallData)
+							logger.info(
+								`↩️ Fallback: repeat_call_in отправлен в RabbitMQ очередь`
+							)
+						}
 					} else {
-						// Другие ошибки логируем как ошибки
-						logger.error(
-							{
-								err: error,
-								message: error.message,
-								code: error.code,
-								url: error.config?.url,
-							},
-							'❌ Ошибка отправки webhook для звонка'
-						)
+						await sendToQueue('repeat_call_in', repeatCallData)
 					}
-				})
-		}
+				}
+			} else {
+				logger.info(
+					`⏭️ REPEAT_ONLY: non-repeat call пропущен (direction=${direction}, hasExistingOrder=${hasExistingOrder})`
+				)
+			}
 	} catch (error) {
 		logger.error(
 			{

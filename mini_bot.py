@@ -22,6 +22,7 @@ RABBIT_PASS = os.environ.get("RABBITMQ_PASS", "guest")
 
 # MongoDB
 MONGO_URI = os.environ.get("MONGO_URI", os.environ.get("CLIENTS_DB_URL", ""))
+
 filled_forms_db = None
 clients_db = None
 users_db = None

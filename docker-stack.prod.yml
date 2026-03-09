@@ -1,0 +1,59 @@
+services:
+  queue-workers:
+    image: ${IMAGE}
+    dns:
+      - 127.0.0.11
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      NODE_ENV: production
+      NGROK_TCP_HOST: ${NGROK_TCP_HOST}
+      NGROK_TCP_PORT: ${NGROK_TCP_PORT}
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASS: ${RABBITMQ_PASS}
+      CALL_DB_URL: ${CALL_DB_URL}
+      SMS_DB_URL: ${SMS_DB_URL}
+      CLIENTS_DB_URL: ${CLIENTS_DB_URL}
+      USERS_DB_URL: ${USERS_DB_URL:-}
+      TELEGRAM_GATEWAY_ENABLED: ${TELEGRAM_GATEWAY_ENABLED:-false}
+      TELEGRAM_GATEWAY_URL: ${TELEGRAM_GATEWAY_URL:-}
+      TELEGRAM_GATEWAY_CALLER_ID: ${TELEGRAM_GATEWAY_CALLER_ID:-}
+      TELEGRAM_GATEWAY_API_KEY: ${TELEGRAM_GATEWAY_API_KEY:-}
+      TELEGRAM_GATEWAY_CHAT_ID: ${TELEGRAM_GATEWAY_CHAT_ID:-}
+      TELEGRAM_GATEWAY_CHAT_ALIAS: ${TELEGRAM_GATEWAY_CHAT_ALIAS:-}
+      TELEGRAM_GATEWAY_EXPECTED_APP_KEY: ${TELEGRAM_GATEWAY_EXPECTED_APP_KEY:-}
+      TELEGRAM_GATEWAY_EXPECTED_ROUTE_KEY: ${TELEGRAM_GATEWAY_EXPECTED_ROUTE_KEY:-}
+      WEBHOOK_SMS_URL: ${WEBHOOK_SMS_URL:-}
+      WEBHOOK_CALL_URL: ${WEBHOOK_CALL_URL:-}
+    ports:
+      - '${QUEUE_WORKERS_PROD_PUBLISHED_PORT:-8000}:8000'
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - ${QUEUE_WORKERS_PROD_PLACEMENT_CONSTRAINT:-node.hostname == tvmm-prod}
+      restart_policy:
+        condition: any
+        delay: 10s
+      resources:
+        limits:
+          cpus: '${QUEUE_WORKERS_PROD_CPU_LIMIT:-1.00}'
+          memory: '${QUEUE_WORKERS_PROD_MEMORY_LIMIT:-1024M}'
+        reservations:
+          cpus: '${QUEUE_WORKERS_PROD_CPU_RESERVATION:-0.25}'
+          memory: '${QUEUE_WORKERS_PROD_MEMORY_RESERVATION:-256M}'
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      rollback_config:
+        parallelism: 1
+        order: stop-first
+    networks:
+      - backend
+
+networks:
+  backend:
+    name: ${QUEUE_WORKERS_PROD_BACKEND_NETWORK:-queue-workers-prod-backend}
+    driver: overlay
+    attachable: true

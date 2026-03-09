@@ -9,6 +9,10 @@ const devProcessingDelayMs = Number(
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 const { zoomThreadCallIn } = require('./utils/zoom/zoomThreadCallIn')
 const { zoomThreadSmsIn } = require('./utils/zoom/zoomThreadSmsIn')
+const {
+	handleGatewayTelegramEvent,
+	verifyGatewayEventHeaders,
+} = require('./utils/gatewayFlow')
 
 // Middleware для парсинга JSON
 app.use(express.json())
@@ -27,6 +31,28 @@ app.post('/webhook/sms', (req, res) => {
 app.post('/webhook/call', (req, res) => {
 	console.log('📞 Webhook Call получен:', req.body)
 	res.status(200).json({ success: true, message: 'Webhook received' })
+})
+
+// Endpoint для входящих событий от Telegram Gateway
+app.post('/internal/telegram/events', async (req, res) => {
+	try {
+		const headerCheck = verifyGatewayEventHeaders(req.headers || {})
+		if (!headerCheck.valid) {
+			return res.status(headerCheck.status).json({
+				ok: false,
+				error: headerCheck.message,
+			})
+		}
+
+		const result = await handleGatewayTelegramEvent(req.body || {})
+		return res.status(200).json({ ok: true, ...result })
+	} catch (error) {
+		console.error('❌ Ошибка обработки /internal/telegram/events:', error.message)
+		return res.status(500).json({
+			ok: false,
+			error: error.message || 'internal error',
+		})
+	}
 })
 
 // Запускаем consumer при старте приложения

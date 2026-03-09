@@ -3,8 +3,11 @@ const mongoose = require('mongoose')
 const logger = require('pino')()
 const { smsSchema } = require('../../models/sms_model')
 const { clientFinder, createNewClient } = require('../clientFinder')
-const axios = require('axios')
 const { sendToQueue } = require('../rabbitmq')
+const {
+	isGatewayEnabled,
+	sendRepeatSmsNotification,
+} = require('../gatewayFlow')
 // Создаем отдельное подключение для SMS базы данных
 // чтобы избежать конфликтов с другими подключениями
 let smsConnection = null
@@ -221,9 +224,9 @@ const zoomThreadSmsIn = async data => {
 			`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}`
 		)
 
-		if (hasExistingOrder && smsType === 'incoming') {
-			logger.info(`⚠️ Повторный клиент ${clientId} — входящее SMS, отправляем уведомление в Telegram`)
-			isFirstMessage = false
+			if (hasExistingOrder && smsType === 'incoming') {
+				logger.info(`⚠️ Повторный клиент ${clientId} — входящее SMS, отправляем уведомление в Telegram`)
+				isFirstMessage = false
 
 			// Dedup: skip if we already sent repeat for this client recently
 			const dedupKey = `sms_${clientNumericId}`
@@ -243,63 +246,32 @@ const zoomThreadSmsIn = async data => {
 					zoomData: data
 				}
 
-				await sendToQueue('repeat_sms_in', repeatSmsData)
-			}
+						if (isGatewayEnabled()) {
+							try {
+								await sendRepeatSmsNotification(repeatSmsData)
+								logger.info(
+									`✅ repeat_sms_in отправлен через Telegram Gateway (client=${clientNumericId})`
+								)
+							} catch (gatewayError) {
+								logger.error(
+									`❌ Ошибка Telegram Gateway для repeat_sms_in: ${gatewayError.message}`
+								)
+								await sendToQueue('repeat_sms_in', repeatSmsData)
+								logger.info(
+									`↩️ Fallback: repeat_sms_in отправлен в RabbitMQ очередь`
+								)
+							}
+						} else {
+							await sendToQueue('repeat_sms_in', repeatSmsData)
+						}
+					}
 
-		} else {
-			isFirstMessage = true
-			// Новый клиент — отправляем webhook для создания заявки
-			const webhookUrl =
-				process.env.WEBHOOK_SMS_URL || 'http://localhost:3000/webhook/sms'
-			logger.info(`ЗАЯВКА ПО ПЕРВОМУ СООБЩЕНИЮ`)
-			axios
-				.post(
-					webhookUrl,
-					{
-						smsType: smsType,
-						isFirstMessage: isFirstMessage,
-						phone: phoneNumber,
-						clientId: clientId,
-						message: message,
-						messageId: messageId,
-						sessionId: sessionId,
-						ownerId: ownerId,
-						dateTime: dateTime,
-					},
-					{
-						headers: {
-							'Content-Type': 'application/json',
-						},
-					}
+			} else {
+				isFirstMessage = true
+				logger.info(
+					`⏭️ REPEAT_ONLY: non-repeat sms пропущен (smsType=${smsType}, hasExistingOrder=${hasExistingOrder})`
 				)
-				.then(response => {
-					logger.info(
-						`✅ SMS сохранено в базу данных: ${phoneNumber} - ${message.substring(
-							0,
-							50
-						)}...`
-					)
-				})
-				.catch(error => {
-					// Если сервер недоступен (ECONNREFUSED), это не критично - логируем как предупреждение
-					if (error.code === 'ECONNREFUSED' || error.code === 'ENOTFOUND') {
-						logger.warn(
-							`⚠️ Webhook сервер недоступен (${error.config?.url}): ${error.message}. SMS сохранено в БД.`
-						)
-					} else {
-						// Другие ошибки логируем как ошибки
-						logger.error(
-							{
-								err: error,
-								message: error.message,
-								code: error.code,
-								url: error.config?.url,
-							},
-							'❌ Ошибка отправки webhook'
-						)
-					}
-				})
-		}
+			}
 
 		// Создаём новую запись SMS
 		const newSms = new model({

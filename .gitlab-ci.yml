@@ -1,0 +1,56 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - when: never
+
+stages:
+  - build
+  - publish
+  - deploy
+
+variables:
+  REGISTRY_IMAGE: '$CI_REGISTRY_IMAGE'
+  DOCKER_DRIVER: overlay2
+
+build-image:
+  stage: build
+  tags:
+    - manager
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build --pull -t "$REGISTRY_IMAGE:$CI_COMMIT_TAG" .
+
+publish-image:
+  stage: publish
+  needs: [build-image]
+  tags:
+    - manager
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker push "$REGISTRY_IMAGE:$CI_COMMIT_TAG"
+
+deploy-dev:
+  stage: deploy
+  needs: [publish-image]
+  tags:
+    - manager
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^dev-/'
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker pull "$REGISTRY_IMAGE:$CI_COMMIT_TAG"
+    - export IMAGE=$REGISTRY_IMAGE:$CI_COMMIT_TAG
+    - docker stack deploy -c docker-stack.dev.yml --with-registry-auth queue-workers-dev
+
+deploy-prod:
+  stage: deploy
+  needs: [publish-image]
+  tags:
+    - manager
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^prod-/'
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker pull "$REGISTRY_IMAGE:$CI_COMMIT_TAG"
+    - export IMAGE=$REGISTRY_IMAGE:$CI_COMMIT_TAG
+    - docker stack deploy -c docker-stack.prod.yml --with-registry-auth queue-workers-prod
