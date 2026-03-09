@@ -1,0 +1,8 @@
+node_modules/
+.env
+.git
+.DS_Store
+*.log
+test_*.js
+test_*.py
+check_*.js

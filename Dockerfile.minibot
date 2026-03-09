@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements-minibot.txt ./
+RUN pip install --no-cache-dir -r requirements-minibot.txt
+COPY mini_bot.py .
+CMD ["python", "mini_bot.py"]
