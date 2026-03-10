@@ -13,8 +13,12 @@ const GATEWAY_ENABLED = String(
 const GATEWAY_URL = (
 	process.env.TELEGRAM_GATEWAY_URL || 'https://telegram.it.tvmountmaster.com'
 ).replace(/\/+$/, '')
-const GATEWAY_CALLER_ID = process.env.TELEGRAM_GATEWAY_CALLER_ID || ''
-const GATEWAY_API_KEY = process.env.TELEGRAM_GATEWAY_API_KEY || ''
+const LEGACY_CALLER_ID = process.env.TELEGRAM_GATEWAY_CALLER_ID || ''
+const LEGACY_API_SECRET = process.env.TELEGRAM_GATEWAY_API_KEY || ''
+const NEW_API_KEY = process.env.TELEGRAM_GATEWAY_API_KEY || process.env.TELEGRAM_GATEWAY_API_KEY_ID || ''
+const NEW_API_SECRET = process.env.TELEGRAM_GATEWAY_API_SECRET || ''
+const GATEWAY_API_KEY = LEGACY_CALLER_ID || NEW_API_KEY
+const GATEWAY_API_SECRET = NEW_API_SECRET || (LEGACY_CALLER_ID ? LEGACY_API_SECRET : '')
 const GATEWAY_CHAT_ID = process.env.TELEGRAM_GATEWAY_CHAT_ID || process.env.TELEGRAM_CHAT_ID || ''
 const GATEWAY_CHAT_ALIAS = process.env.TELEGRAM_GATEWAY_CHAT_ALIAS || ''
 const EXPECTED_APP_KEY = process.env.TELEGRAM_GATEWAY_EXPECTED_APP_KEY || ''
@@ -98,9 +102,9 @@ const getCollectionModel = async name => {
 }
 
 const gatewayPostInternal = async ({ operationType, payload, idempotencyKey, correlationId }) => {
-	if (!GATEWAY_CALLER_ID || !GATEWAY_API_KEY) {
+	if (!GATEWAY_API_KEY || !GATEWAY_API_SECRET) {
 		throw new Error(
-			'TELEGRAM_GATEWAY_CALLER_ID and TELEGRAM_GATEWAY_API_KEY must be configured'
+			'Gateway auth is not configured. Use either legacy TELEGRAM_GATEWAY_CALLER_ID+TELEGRAM_GATEWAY_API_KEY or new TELEGRAM_GATEWAY_API_KEY+TELEGRAM_GATEWAY_API_SECRET'
 		)
 	}
 
@@ -111,8 +115,8 @@ const gatewayPostInternal = async ({ operationType, payload, idempotencyKey, cor
 	}
 
 	const headers = {
-		'x-caller-id': GATEWAY_CALLER_ID,
-		'x-internal-api-key': GATEWAY_API_KEY,
+		'x-api-key': GATEWAY_API_KEY,
+		'x-api-secret': GATEWAY_API_SECRET,
 		'x-correlation-id': correlationId || crypto.randomUUID(),
 		'content-type': 'application/json',
 	}
