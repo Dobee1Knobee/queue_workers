@@ -52,6 +52,31 @@ services:
     networks:
       - backend
 
+  mini-bot:
+    image: ${IMAGE_MINIBOT}
+    environment:
+      PYTHONUNBUFFERED: 1
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
+      NGROK_TCP_HOST: ${NGROK_TCP_HOST}
+      NGROK_TCP_PORT: ${NGROK_TCP_PORT}
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASS: ${RABBITMQ_PASS}
+      MONGO_URI: ${MONGO_URI:-${CLIENTS_DB_URL}}
+      AUTO_CLAIM_ADMIN: ${AUTO_CLAIM_ADMIN:-}
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - ${MINI_BOT_PROD_PLACEMENT_CONSTRAINT:-node.hostname == tvmm-prod}
+      restart_policy:
+        condition: any
+        delay: 10s
+        max_attempts: 3
+    networks:
+      - backend
+
 networks:
   backend:
     name: ${QUEUE_WORKERS_PROD_BACKEND_NETWORK:-queue-workers-prod-backend}

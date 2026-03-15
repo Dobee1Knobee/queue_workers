@@ -7,7 +7,9 @@ const { sendToQueue } = require('../rabbitmq')
 const {
 	isGatewayEnabled,
 	sendRepeatCallNotification,
+	sendMissedCallNotification,
 } = require('../gatewayFlow')
+const { tryAutoClaimOpenLeadFromCall } = require('../autoClaim')
 
 let callConnection = null
 let CallModel = null
@@ -130,7 +132,18 @@ const getCallConnection = async () => {
 	CallModel = callConnection.model('Call', callSchema, 'call')
 	return { connection: callConnection, model: CallModel }
 }
-// Dedup: skip repeat notifications for the same client within 10 minutes
+const MISSED_CALL_RESULTS = new Set([
+	'no answer',
+	'busy',
+	'failed',
+	'declined',
+	'missed',
+	'voicemail',
+])
+
+const normalizeCallResult = result => String(result || '').trim().toLowerCase()
+
+// Dedup: skip duplicate lead notifications for the same client in a short window
 const recentRepeatClients = new Map()
 const REPEAT_DEDUP_MS = 3 * 60 * 1000
 
@@ -193,6 +206,13 @@ const zoomThreadCallIn = async data => {
 		if (!ext) {
 			ext = external === caller_number ? callee_number : caller_number
 		}
+	}
+
+	// Проверка: если номер слишком короткий - это экстеншен, а не клиент
+	const customerDigits = normalizeDigits(customerNumber)
+	if (customerDigits.length > 0 && customerDigits.length <= 6) {
+		logger.info(`⚠️ Пропускаем звонок: номер ${customerNumber} похож на экстеншен (${customerDigits.length} цифр)`)
+		return { success: false, message: 'Likely extension, not a client number' }
 	}
 
 	// callData можно хранить как угодно — просто пример
@@ -280,18 +300,26 @@ const zoomThreadCallIn = async data => {
 			Math.floor(twoWeeksAgo.getTime() / 1000).toString(16) + '0000000000000000'
 		);
 
-		// Запрашиваем из базы заказы за последние 2 недели
-		const recentOrders = await OrdersModel.find({ 
-			client_id: clientNumericId,
-			_id: { $gte: twoWeeksAgoId }
-		}).sort({ _id: -1 }).limit(10);
+			// Запрашиваем из базы заказы за последние 2 недели
+			const recentOrders = await OrdersModel.find({
+				client_id: clientNumericId,
+				_id: { $gte: twoWeeksAgoId }
+			}).sort({ _id: -1 }).limit(10);
 
-		// По ТЗ: "была ли за последние 2 недели запись в таблице хендимен с таким client_id"
-		const hasExistingOrder = recentOrders.length > 0;
+			// И любые заказы клиента (для определения "старше 2 недель")
+			const allOrders = await OrdersModel.find({
+				client_id: clientNumericId,
+			}).sort({ _id: -1 }).limit(10)
 
-		logger.info(
-			`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}`
-		)
+				const hasAnyOrder = allOrders.length > 0
+				const hasRecentOrder = recentOrders.length > 0
+				const isRepeatCall = hasAnyOrder && !hasRecentOrder && direction === 'inbound'
+				const isMissedInboundCall =
+					direction === 'inbound' && MISSED_CALL_RESULTS.has(normalizeCallResult(result))
+
+			logger.info(
+				`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}, всего=${allOrders.length}`
+			)
 
 		// Сохраняем звонок в базу данных
 		const callDataToSave = {
@@ -312,29 +340,83 @@ const zoomThreadCallIn = async data => {
 
 		logger.info(`✅ Call успешно сохранен в БД с _id: ${call._id}`)
 
-			if (hasExistingOrder && direction === 'inbound') {
-				logger.info(`✅ Call сохранено (заказ уже существует, входящий): ${customerNumber}`)
+					if (isMissedInboundCall) {
+						logger.info(
+							`☎️ Missed inbound call detected (result=${result || 'unknown'}) — отправляем claim lead`
+						)
 
-			// Dedup: skip if we already sent repeat for this client recently
-			const dedupKey = `call_${clientNumericId}`
-			const lastSent = recentRepeatClients.get(dedupKey)
+						const dedupKey = `missed_call_${clientNumericId}`
+						const lastSent = recentRepeatClients.get(dedupKey)
+						if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+							logger.info(
+								`⏭️ Дедупликация: missed call lead для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`
+							)
+						} else {
+							recentRepeatClients.set(dedupKey, Date.now())
+
+							const missedCallData = {
+								client_id: clientId,
+								client_numeric_id: clientNumericId,
+								customer_number: customerNumber,
+								orders: allOrders,
+								direction,
+								ext,
+								duration,
+								result,
+								date_time: callEndDate,
+								lead_type: 'missed_call',
+								team: responsibleManager?.team || null,
+								manager_at: responsibleManager?.at || null,
+								manager_id: responsibleManager?.manager_id || null,
+								zoomData: data,
+							}
+
+							if (isGatewayEnabled()) {
+								try {
+									await sendMissedCallNotification(missedCallData)
+									logger.info(
+										`✅ missed_call lead отправлен через Telegram Gateway (client=${clientNumericId})`
+									)
+								} catch (gatewayError) {
+									logger.error(
+										`❌ Ошибка Telegram Gateway для missed_call lead: ${gatewayError.message}`
+									)
+									await sendToQueue('repeat_call_in', missedCallData)
+									logger.info(
+										'↩️ Fallback: missed_call lead отправлен в RabbitMQ очередь repeat_call_in'
+									)
+								}
+							} else {
+								await sendToQueue('repeat_call_in', missedCallData)
+							}
+						}
+					} else if (isRepeatCall) {
+						logger.info(`✅ Repeat call (последний заказ старше 2 недель), входящий: ${customerNumber}`)
+
+				// Dedup: skip if we already sent repeat for this client recently
+				const dedupKey = `repeat_call_${clientNumericId}`
+				const lastSent = recentRepeatClients.get(dedupKey)
 			if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
 				logger.info(`⏭️ Дедупликация: repeat_call_in для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`)
 			} else {
 				recentRepeatClients.set(dedupKey, Date.now())
 
 				// Отправляем сообщение в RabbitMQ о повторном звонке
-				const repeatCallData = {
-					client_id: clientId,
-					client_numeric_id: clientNumericId,
-					customer_number: customerNumber,
-					orders: recentOrders,
-					direction: direction,
-					ext: ext,
-					duration: duration,
-					callEnd: callEndDate,
-					zoomData: data
-				}
+					const repeatCallData = {
+						client_id: clientId,
+						client_numeric_id: clientNumericId,
+						customer_number: customerNumber,
+						orders: allOrders,
+						direction: direction,
+						ext: ext,
+						duration: duration,
+						result: result,
+						date_time: callEndDate,
+						team: responsibleManager?.team || null,
+						manager_at: responsibleManager?.at || null,
+						manager_id: responsibleManager?.manager_id || null,
+						zoomData: data
+					}
 
 					if (isGatewayEnabled()) {
 						try {
@@ -355,11 +437,75 @@ const zoomThreadCallIn = async data => {
 						await sendToQueue('repeat_call_in', repeatCallData)
 					}
 				}
-			} else {
-				logger.info(
-					`⏭️ REPEAT_ONLY: non-repeat call пропущен (direction=${direction}, hasExistingOrder=${hasExistingOrder})`
-				)
-			}
+				} else {
+					logger.info(
+						`⏭️ REPEAT_ONLY: non-repeat call пропущен (direction=${direction}, hasAnyOrder=${hasAnyOrder}, hasRecentOrder=${hasRecentOrder})`
+					)
+				}
+
+				// Check if this is an answered inbound call (new lead)
+				// Send to new_inbound_lead queue for direct-to-DM routing
+				const normalizedCallResult = normalizeCallResult(result)
+				const isAnsweredInbound = 
+					direction === 'inbound' &&
+					!MISSED_CALL_RESULTS.has(normalizedCallResult) &&
+					responsibleManager &&
+					responsibleManager.at &&
+					!hasRecentOrder // Only for new clients, not repeats
+
+				if (isAnsweredInbound) {
+					const inboundLeadData = {
+						client_id: clientId,
+						client_numeric_id: clientNumericId,
+						customer_number: customerNumber,
+						lead_type: 'answered_call',
+						result: result,
+						ext: ext,
+						manager_at: responsibleManager.at,
+						manager_id: responsibleManager.manager_id,
+						team: responsibleManager.team,
+						duration: duration,
+					}
+
+					try {
+						const dedupKey = `new_inbound_lead_${clientNumericId}`
+						const lastSent = recentRepeatClients.get(dedupKey)
+						if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+							logger.info(
+								`⏭️ Дедупликация: new_inbound_lead для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`
+							)
+						} else {
+							recentRepeatClients.set(dedupKey, Date.now())
+							await sendToQueue('new_inbound_lead', inboundLeadData)
+							logger.info(
+								`✅ new_inbound_lead отправлен для answered call client=${clientNumericId}, manager=${responsibleManager.at}`
+							)
+						}
+					} catch (queueError) {
+						logger.error(
+							`❌ Ошибка отправки в new_inbound_lead: ${queueError.message}`
+						)
+					}
+
+				}
+
+				try {
+					await tryAutoClaimOpenLeadFromCall({
+						clientId: clientNumericId,
+						phone: customerNumber,
+						managerPhone:
+							direction === 'outbound' ? caller_number : callee_number,
+						direction,
+						duration,
+						result,
+						responsibleManager,
+						callId: log?.id || log?.call_id || null,
+					})
+				} catch (autoClaimError) {
+					logger.warn(
+						`⚠️ Auto-claim shadow skipped for call client=${clientNumericId}: ${autoClaimError.message}`
+					)
+				}
 	} catch (error) {
 		logger.error(
 			{

@@ -8,6 +8,7 @@ const {
 	isGatewayEnabled,
 	sendRepeatSmsNotification,
 } = require('../gatewayFlow')
+const { tryAutoClaimOpenLeadFromSms } = require('../autoClaim')
 // Создаем отдельное подключение для SMS базы данных
 // чтобы избежать конфликтов с другими подключениями
 let smsConnection = null
@@ -162,6 +163,13 @@ const zoomThreadSmsIn = async data => {
 		const phoneNumber = getClientPhoneFromSms(eventType, smsData)
 		const smsType = getSmsType(eventType)
 
+		// Проверка: если номер слишком короткий - это может быть ошибка
+		const phoneDigits = (phoneNumber || '').replace(/\D/g, '')
+		if (phoneDigits.length > 0 && phoneDigits.length <= 6) {
+			logger.info(`⚠️ Пропускаем SMS: номер ${phoneNumber} похож на экстеншен (${phoneDigits.length} цифр)`)
+			return { success: false, message: 'Likely extension, not a client number' }
+		}
+
 		// Ищем клиента по номеру телефона
 		let client = await clientFinder(phoneNumber)
 		let clientId = null
@@ -184,6 +192,7 @@ const zoomThreadSmsIn = async data => {
 		const messageId = smsData.message_id || null
 		const sessionId = smsData.session_id || null
 		const ownerId = smsData.owner?.id || null
+		const managerPhone = smsData.owner?.phone_number || null
 		const dateTime = smsData.date_time
 			? new Date(smsData.date_time)
 			: new Date()
@@ -204,6 +213,11 @@ const zoomThreadSmsIn = async data => {
 			new mongoose.Schema({}, { strict: false }),
 			'orders'
 		)
+		const UsersModel = tvmountConn.models.users || tvmountConn.model(
+			'users',
+			new mongoose.Schema({}, { strict: false }),
+			'users'
+		)
 
 		const twoWeeksAgo = new Date();
 		twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
@@ -211,24 +225,30 @@ const zoomThreadSmsIn = async data => {
 			Math.floor(twoWeeksAgo.getTime() / 1000).toString(16) + '0000000000000000'
 		);
 
-		// Запрашиваем из базы заказы за последние 2 недели
-		const recentOrders = await OrdersModel.find({
-			client_id: clientNumericId,
-			_id: { $gte: twoWeeksAgoId }
-		}).sort({ _id: -1 }).limit(10);
+			// Запрашиваем из базы заказы за последние 2 недели
+			const recentOrders = await OrdersModel.find({
+				client_id: clientNumericId,
+				_id: { $gte: twoWeeksAgoId }
+			}).sort({ _id: -1 }).limit(10);
 
-		// По ТЗ: "была ли за последние 2 недели запись в таблице хендимен с таким client_id"
-		const hasExistingOrder = recentOrders.length > 0;
+			// И любые заказы клиента (для определения "старше 2 недель")
+			const allOrders = await OrdersModel.find({
+				client_id: clientNumericId,
+			}).sort({ _id: -1 }).limit(10);
 
-		logger.info(
-			`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}`
-		)
+			const hasAnyOrder = allOrders.length > 0
+			const hasRecentOrder = recentOrders.length > 0
+			const isRepeatSms = hasAnyOrder && !hasRecentOrder && smsType === 'incoming'
 
-			if (hasExistingOrder && smsType === 'incoming') {
-				logger.info(`⚠️ Повторный клиент ${clientId} — входящее SMS, отправляем уведомление в Telegram`)
-				isFirstMessage = false
+			logger.info(
+				`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}, всего=${allOrders.length}`
+			)
 
-			// Dedup: skip if we already sent repeat for this client recently
+				if (isRepeatSms) {
+					logger.info(`⚠️ Повторный клиент ${clientId} (последний заказ старше 2 недель) — отправляем уведомление в Telegram`)
+					isFirstMessage = false
+
+				// Dedup: skip if we already sent repeat for this client recently
 			const dedupKey = `sms_${clientNumericId}`
 			const lastSent = recentRepeatClients.get(dedupKey)
 			if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
@@ -236,14 +256,29 @@ const zoomThreadSmsIn = async data => {
 			} else {
 				recentRepeatClients.set(dedupKey, Date.now())
 
-				const repeatSmsData = {
-					client_id: clientId,
-					client_numeric_id: clientNumericId,
-					customer_number: phoneNumber,
-					orders: recentOrders,
-					message: message,
-					smsType: smsType,
-					zoomData: data
+				// Find manager for SMS (recipient phone number)
+				const managerPhone = smsData.to_members?.[0]?.phone_number || null
+				let managerInfo = null
+				if (managerPhone) {
+					const normalizedManagerPhone = managerPhone.replace(/\D/g, '').slice(-10)
+					managerInfo = await UsersModel.findOne({
+						'phone_numbers.number': {
+							$regex: normalizedManagerPhone.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+						},
+					})
+				}
+
+					const repeatSmsData = {
+						client_id: clientId,
+						client_numeric_id: clientNumericId,
+						customer_number: phoneNumber,
+						orders: allOrders,
+						message: message,
+						smsType: smsType,
+						date_time: dateTime,
+						team: managerInfo?.team || null,
+						manager_at: managerInfo?.at || null,
+						zoomData: data
 				}
 
 						if (isGatewayEnabled()) {
@@ -266,12 +301,20 @@ const zoomThreadSmsIn = async data => {
 						}
 					}
 
-			} else {
-				isFirstMessage = true
-				logger.info(
-					`⏭️ REPEAT_ONLY: non-repeat sms пропущен (smsType=${smsType}, hasExistingOrder=${hasExistingOrder})`
-				)
-			}
+				} else {
+					// SMS по активному заказу (<= 2 недель) не считаем repeat
+					if (hasRecentOrder && smsType === 'incoming') {
+						isFirstMessage = false
+						logger.info(
+							`📨 SMS по активному заказу клиента ${clientNumericId} (<= 2 недель), repeat уведомление пропущено`
+						)
+					} else {
+						isFirstMessage = true
+					}
+					logger.info(
+						`⏭️ REPEAT_ONLY: non-repeat sms пропущен (smsType=${smsType}, hasAnyOrder=${hasAnyOrder}, hasRecentOrder=${hasRecentOrder})`
+					)
+				}
 
 		// Создаём новую запись SMS
 		const newSms = new model({
@@ -293,6 +336,79 @@ const zoomThreadSmsIn = async data => {
 				50
 			)}...`
 		)
+
+		// Check if this is a new inbound SMS with extension info
+		// For inbound SMS: sender = client, to_members[0] = manager
+		if (smsType === 'incoming' && !hasRecentOrder) {
+			// Get manager's phone number from to_members
+			const managerPhone = smsData.to_members?.[0]?.phone_number || null
+			
+			// Try to find the manager by phone number (like button_bot.py does)
+			let manager = null
+			if (managerPhone) {
+				const normalizedManagerPhone = managerPhone.replace(/\D/g, '').slice(-10)
+				manager = await UsersModel.findOne({
+					'phone_numbers.number': {
+						$regex: normalizedManagerPhone.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+					},
+				})
+			}
+
+			// If found, send to new_inbound_lead queue
+			if (manager && manager.at) {
+				const inboundLeadData = {
+					client_id: clientId,
+					client_numeric_id: clientNumericId,
+					customer_number: phoneNumber,
+					message: message,
+					lead_type: 'inbound_sms',
+					ext: manager.extension_number || null,
+					manager_at: manager.at,
+					manager_id: manager.manager_id,
+					team: manager.team,
+				}
+
+				try {
+					const dedupKey = `new_inbound_lead_${clientNumericId}`
+					const lastSent = recentRepeatClients.get(dedupKey)
+					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+						logger.info(
+							`⏭️ Дедупликация: new_inbound_lead (SMS) для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`
+						)
+					} else {
+						recentRepeatClients.set(dedupKey, Date.now())
+						await sendToQueue('new_inbound_lead', inboundLeadData)
+						logger.info(
+							`✅ new_inbound_lead отправлен для SMS client=${clientNumericId}, manager=${manager.at}`
+						)
+					}
+				} catch (queueError) {
+					logger.error(
+						`❌ Ошибка отправки в new_inbound_lead: ${queueError.message}`
+					)
+				}
+
+			} else {
+				logger.warn(
+					`⚠️ SMS received but manager not found for phone=${managerPhone}, skipping new_inbound_lead`
+				)
+			}
+		}
+
+		try {
+			await tryAutoClaimOpenLeadFromSms({
+				clientId: clientNumericId,
+				phone: phoneNumber,
+				managerPhone,
+				smsType,
+				ownerId,
+				messageId,
+			})
+		} catch (autoClaimError) {
+			logger.warn(
+				`⚠️ Auto-claim shadow skipped for sms client=${clientNumericId}: ${autoClaimError.message}`
+			)
+		}
 
 		return {
 			success: true,

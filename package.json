@@ -16,7 +16,8 @@
   "main": "app.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "nodemon app.js"
+    "start": "nodemon app.js",
+    "lint": "node --check app.js utils/**/*.js"
   },
   "dependencies": {
     "amqplib": "^0.10.9",

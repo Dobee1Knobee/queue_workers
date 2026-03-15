@@ -4,3 +4,19 @@ node_modules/
 .env
 
 package-lock.json
+
+# Agent and Meta files
+.opencode/
+.agents/
+AGENTS.md
+CONTRIBUTING.md
+SECURITY.md
+CODE_OF_CONDUCT.md
+SECURITY.md
+.github/
+task.md
+walkthrough.md
+implementation_plan.md
+system_overview.md
+process_description.md
+manager_report.md

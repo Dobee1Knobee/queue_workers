@@ -46,6 +46,22 @@ const getOrderId = order => {
 
 const formatUtcIso = date => date.toISOString().replace(/\.\d{3}Z$/, 'Z')
 
+const buildValueVariants = value => {
+	if (value === null || value === undefined) return []
+	const values = [value, String(value)]
+	const numeric = Number(value)
+	if (Number.isFinite(numeric)) values.push(numeric)
+	return [...new Set(values)]
+}
+
+const parseClaimClientId = callbackData => {
+	if (typeof callbackData !== 'string' || !callbackData.startsWith('claim:')) return null
+	const raw = callbackData.slice('claim:'.length).trim()
+	if (!raw) return null
+	const numeric = Number(raw)
+	return Number.isFinite(numeric) ? numeric : raw
+}
+
 const getGatewayChatTarget = () => {
 	if (GATEWAY_CHAT_ALIAS) return { chatAlias: GATEWAY_CHAT_ALIAS }
 	if (GATEWAY_CHAT_ID) return { chatId: String(GATEWAY_CHAT_ID) }
@@ -113,6 +129,9 @@ const gatewayPostInternal = async ({ operationType, payload, idempotencyKey, cor
 		operationType,
 		payload,
 	}
+	logger.info(
+		`➡️ [gateway] op=${operationType} idempotencyKey=${requestBody.idempotencyKey}`
+	)
 
 	const headers = {
 		'x-api-key': GATEWAY_API_KEY,
@@ -136,6 +155,9 @@ const gatewayPostInternal = async ({ operationType, payload, idempotencyKey, cor
 				`Gateway internal request failed: ${resp.status} ${JSON.stringify(resp.data || {})}`
 			)
 		}
+		logger.info(
+			`⬅️ [gateway] op=${operationType} status=${resp.status} tx=${resp.data?.transactionId || 'n/a'}`
+		)
 		return resp.data
 	} catch (error) {
 		const details = error.response
@@ -162,7 +184,7 @@ const safeAnswerCallback = async (callbackQueryId, text, showAlert = false) => {
 	}
 }
 
-const buildRepeatMessage = ({ type, clientNumericId, recentOrders }) => {
+const buildLeadMessage = ({ type, clientNumericId, recentOrders, callResult }) => {
 	let orderIdsText = ''
 	for (const order of recentOrders || []) {
 		const orderId = getOrderId(order)
@@ -173,19 +195,24 @@ const buildRepeatMessage = ({ type, clientNumericId, recentOrders }) => {
 	if (type === 'call') {
 		return `📞 Повторный звонок\nКлиент: #c${clientNumericId}${orderBlock}`
 	}
+	if (type === 'missed_call') {
+		const statusLine = callResult ? `\nСтатус: ${callResult}` : ''
+		return `☎️ Пропущенный звонок\nКлиент: #c${clientNumericId}${statusLine}${orderBlock}`
+	}
 	return `💬 Повторное СМС\nКлиент: #c${clientNumericId}${orderBlock}`
 }
 
-const sendRepeatNotificationToGateway = async ({ type, repeatData }) => {
-	const clientNumericId = repeatData.client_numeric_id || repeatData.client_id
-	const customerNumber = repeatData.customer_number || ''
-	const messageText = repeatData.message || ''
-	const recentOrders = repeatData.orders || []
-	const text = buildRepeatMessage({ type, clientNumericId, recentOrders })
+const sendLeadNotificationToGateway = async ({ type, leadData }) => {
+	const clientNumericId = leadData.client_numeric_id || leadData.client_id
+	const customerNumber = leadData.customer_number || ''
+	const messageText = leadData.message || ''
+	const recentOrders = leadData.orders || []
+	const callResult = leadData.result || ''
+	const text = buildLeadMessage({ type, clientNumericId, recentOrders, callResult })
 
 	const sendResp = await gatewayPostInternal({
 		operationType: 'send_message',
-		idempotencyKey: makeIdempotencyKey(`repeat-${type}-${clientNumericId}`),
+		idempotencyKey: makeIdempotencyKey(`lead-${type}-${clientNumericId}`),
 		payload: {
 			...getGatewayChatTarget(),
 			text,
@@ -208,7 +235,8 @@ const sendRepeatNotificationToGateway = async ({ type, repeatData }) => {
 	await FilledFormsModel.create({
 		chat_team: 'TEST',
 		team_: 'test_gateway',
-		cpmn_name: type === 'call' ? 'repeat_call' : 'repeat_sms',
+		cpmn_name:
+			type === 'sms' ? 'repeat_sms' : type === 'missed_call' ? 'missed_call' : 'repeat_call',
 		client_id: clientNumericId,
 		telephone: customerNumber,
 		...(type === 'sms' ? { sms_text: messageText } : {}),
@@ -225,10 +253,13 @@ const sendRepeatNotificationToGateway = async ({ type, repeatData }) => {
 }
 
 const sendRepeatCallNotification = repeatData =>
-	sendRepeatNotificationToGateway({ type: 'call', repeatData })
+	sendLeadNotificationToGateway({ type: 'call', leadData: repeatData })
 
 const sendRepeatSmsNotification = repeatData =>
-	sendRepeatNotificationToGateway({ type: 'sms', repeatData })
+	sendLeadNotificationToGateway({ type: 'sms', leadData: repeatData })
+
+const sendMissedCallNotification = missedData =>
+	sendLeadNotificationToGateway({ type: 'missed_call', leadData: missedData })
 
 const extractGatewayCallback = payload => {
 	const callbackQuery = payload?.callbackQuery || payload?.rawUpdate?.callback_query || {}
@@ -274,6 +305,7 @@ const handleGatewayTelegramEvent = async payload => {
 	if (!callback.callbackData || !callback.callbackData.startsWith('claim:')) {
 		return { handled: false, reason: 'ignored non-claim callback' }
 	}
+	const claimClientId = parseClaimClientId(callback.callbackData)
 
 	const messageId = Number(callback.messageId)
 	if (!Number.isFinite(messageId)) {
@@ -285,9 +317,28 @@ const handleGatewayTelegramEvent = async payload => {
 	const UsersModel = await getCollectionModel('users')
 	const ClientsModel = await getCollectionModel('clients')
 
-	const form = await FilledFormsModel.findOne({
-		$or: [{ chat_message_id: messageId }, { chat_message_id: String(messageId) }],
-	})
+	const formQuery = {
+		$and: [
+			{
+				$or: buildValueVariants(messageId).map(value => ({ chat_message_id: value })),
+			},
+			{
+				$or: [{ source: 'telegram_gateway' }, { team_: 'test_gateway' }],
+			},
+		],
+	}
+	if (claimClientId !== null) {
+		formQuery.$and.push({
+			$or: buildValueVariants(claimClientId).map(value => ({ client_id: value })),
+		})
+	}
+	if (callback.chatId !== null && callback.chatId !== undefined) {
+		formQuery.$and.push({
+			$or: buildValueVariants(callback.chatId).map(value => ({ test_chat_id: value })),
+		})
+	}
+
+	const form = await FilledFormsModel.findOne(formQuery).sort({ _id: -1 })
 
 	if (!form) {
 		await safeAnswerCallback(callback.callbackQueryId, 'Form not found', true)
@@ -420,6 +471,7 @@ module.exports = {
 	isGatewayEnabled,
 	sendRepeatCallNotification,
 	sendRepeatSmsNotification,
+	sendMissedCallNotification,
 	handleGatewayTelegramEvent,
 	verifyGatewayEventHeaders,
 }
