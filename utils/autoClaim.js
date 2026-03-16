@@ -596,4 +596,6 @@ const tryAutoClaimOpenLeadFromSms = async ({
 module.exports = {
 	tryAutoClaimOpenLeadFromCall,
 	tryAutoClaimOpenLeadFromSms,
+	resolveEffectiveManager,
+	findUserByAt,
 }

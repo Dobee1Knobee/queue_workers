@@ -9,13 +9,67 @@ const {
 	sendRepeatSmsNotification,
 } = require('../gatewayFlow')
 const { tryAutoClaimOpenLeadFromSms } = require('../autoClaim')
-// Создаем отдельное подключение для SMS базы данных
-// чтобы избежать конфликтов с другими подключениями
+const SHIFT_REPLACEMENTS = require('../../config/shiftReplacements')
+
 let smsConnection = null
 let SmsModel = null
-
-// Подключение к базе данных tvmount для работы с fastQuiz
 let tvmountConnection = null
+
+const REPEAT_CONTACT_WINDOW_DAYS = 14
+
+const findClaimedManagerForClient = async (clientId, tvmountConn) => {
+	if (!clientId) return null
+	
+	const cutoff = new Date(Date.now() - REPEAT_CONTACT_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+	const FilledFormsModel = tvmountConn.models.filled_forms || tvmountConn.model(
+		'filled_forms',
+		new mongoose.Schema({}, { strict: false }),
+		'filled_forms'
+	)
+	
+	const form = await FilledFormsModel.findOne({
+		client_id: clientId,
+		manager_at: { $exists: true, $ne: null, $ne: '' },
+		date: { $gte: cutoff.toISOString() },
+	}).sort({ date: -1 })
+	
+	if (!form) return null
+	
+	const managerAt = form.get('manager_at')
+	if (!managerAt) return null
+	
+	const UsersModel = tvmountConn.models.users || tvmountConn.model(
+		'users',
+		new mongoose.Schema({}, { strict: false }),
+		'users'
+	)
+	
+	const managerDoc = await UsersModel.findOne({ at: managerAt })
+	if (!managerDoc) return null
+	
+	// Check if manager is working
+	if (managerDoc.working !== false) {
+		return managerDoc
+	}
+	
+	// Manager not working - check for replacement
+	const replacementAt = SHIFT_REPLACEMENTS[managerAt]
+	if (!replacementAt) {
+		return managerDoc
+	}
+	
+	const replacementDoc = await UsersModel.findOne({ at: replacementAt })
+	if (!replacementDoc || replacementDoc.working === false) {
+		return managerDoc
+	}
+	
+	// Return replacement manager
+	return {
+		...replacementDoc.toObject(),
+		delegated_from_at: managerAt,
+		delegated_from_manager_id: managerDoc.manager_id,
+	}
+}
 
 const getTvmountConnection = async () => {
 	// Используем TVMOUNT_DB_URL если задан, иначе CLIENT_DB_URL, иначе формируем из SMS_DB_URL
@@ -238,88 +292,29 @@ const zoomThreadSmsIn = async data => {
 
 			const hasAnyOrder = allOrders.length > 0
 			const hasRecentOrder = recentOrders.length > 0
-			const isRepeatSms = hasAnyOrder && !hasRecentOrder && smsType === 'incoming'
 
 			logger.info(
-				`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}, всего=${allOrders.length}`
+				`🔍 SMS: smsType=${smsType}, orders (2 недели)=${recentOrders.length}, всего=${allOrders.length}`
 			)
 
-				if (isRepeatSms) {
-					logger.info(`⚠️ Повторный клиент ${clientId} (последний заказ старше 2 недель) — отправляем уведомление в Telegram`)
-					isFirstMessage = false
-
-				// Dedup: skip if we already sent repeat for this client recently
-			const dedupKey = `sms_${clientNumericId}`
-			const lastSent = recentRepeatClients.get(dedupKey)
-			if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
-				logger.info(`⏭️ Дедупликация: repeat_sms_in для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`)
-			} else {
-				recentRepeatClients.set(dedupKey, Date.now())
-
-				// Find manager for SMS (recipient phone number)
-				const managerPhone = smsData.to_members?.[0]?.phone_number || null
-				let managerInfo = null
-				if (managerPhone) {
-					const normalizedManagerPhone = managerPhone.replace(/\D/g, '').slice(-10)
-					managerInfo = await UsersModel.findOne({
-						'phone_numbers.number': {
-							$regex: normalizedManagerPhone.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-						},
-					})
-				}
-
-					const repeatSmsData = {
-						client_id: clientId,
-						client_numeric_id: clientNumericId,
-						customer_number: phoneNumber,
-						orders: allOrders,
-						message: message,
-						smsType: smsType,
-						date_time: dateTime,
-						team: managerInfo?.team || null,
-						manager_at: managerInfo?.at || null,
-						zoomData: data
-				}
-
-						if (isGatewayEnabled()) {
-							try {
-								await sendRepeatSmsNotification(repeatSmsData)
-								logger.info(
-									`✅ repeat_sms_in отправлен через Telegram Gateway (client=${clientNumericId})`
-								)
-							} catch (gatewayError) {
-								logger.error(
-									`❌ Ошибка Telegram Gateway для repeat_sms_in: ${gatewayError.message}`
-								)
-								await sendToQueue('repeat_sms_in', repeatSmsData)
-								logger.info(
-									`↩️ Fallback: repeat_sms_in отправлен в RabbitMQ очередь`
-								)
-							}
-						} else {
-							await sendToQueue('repeat_sms_in', repeatSmsData)
-						}
-					}
-
-				} else {
-					// SMS по активному заказу (<= 2 недель) не считаем repeat
-					if (hasRecentOrder && smsType === 'incoming') {
-						isFirstMessage = false
-						logger.info(
-							`📨 SMS по активному заказу клиента ${clientNumericId} (<= 2 недель), repeat уведомление пропущено`
-						)
-					} else {
-						isFirstMessage = true
-					}
-					logger.info(
-						`⏭️ REPEAT_ONLY: non-repeat sms пропущен (smsType=${smsType}, hasAnyOrder=${hasAnyOrder}, hasRecentOrder=${hasRecentOrder})`
-					)
-				}
+		// Find manager by phone (for incoming SMS, check to_members; for outgoing, check owner)
+		let responsibleManager = null
+		if (smsType === 'incoming') {
+			const recipientPhone = smsData.to_members?.[0]?.phone_number || null
+			if (recipientPhone) {
+				const normalizedPhone = recipientPhone.replace(/\D/g, '').slice(-10)
+				responsibleManager = await UsersModel.findOne({
+					'phone_numbers.number': {
+						$regex: normalizedPhone.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+					},
+				})
+			}
+		}
 
 		// Создаём новую запись SMS
 		const newSms = new model({
 			smsType: smsType,
-			isFirstMessage: isFirstMessage,
+			isFirstMessage: smsType === 'incoming',
 			phone: phoneNumber,
 			clientId: clientId,
 			message: message,
@@ -331,83 +326,137 @@ const zoomThreadSmsIn = async data => {
 
 		await newSms.save()
 		logger.info(
-			`✅ SMS сохранено в базу данных: ${phoneNumber} - ${message.substring(
-				0,
-				50
-			)}...`
+			`✅ SMS сохранено: ${phoneNumber} - ${message.substring(0, 50)}...`
 		)
 
-		// Check if this is a new inbound SMS with extension info
-		// For inbound SMS: sender = client, to_members[0] = manager
-		if (smsType === 'incoming' && !hasRecentOrder) {
-			// Get manager's phone number from to_members
-			const managerPhone = smsData.to_members?.[0]?.phone_number || null
+		// ============================================================
+		// INCOMING SMS LOGIC
+		// ============================================================
+		if (smsType === 'incoming') {
+			// First check: does client have a claimed manager (< 2 weeks)?
+			const claimedManager = await findClaimedManagerForClient(clientNumericId, tvmountConn)
 			
-			// Try to find the manager by phone number (like button_bot.py does)
-			let manager = null
-			if (managerPhone) {
-				const normalizedManagerPhone = managerPhone.replace(/\D/g, '').slice(-10)
-				manager = await UsersModel.findOne({
-					'phone_numbers.number': {
-						$regex: normalizedManagerPhone.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-					},
-				})
-			}
+			// Has claimed manager → DM directly
+			if (claimedManager && claimedManager.at) {
+				logger.info(
+					`📱 Incoming SMS - client has claimed manager @${claimedManager.at}`
+				)
 
-			// If found, send to new_inbound_lead queue
-			if (manager && manager.at) {
 				const inboundLeadData = {
 					client_id: clientId,
 					client_numeric_id: clientNumericId,
 					customer_number: phoneNumber,
 					message: message,
 					lead_type: 'inbound_sms',
-					ext: manager.extension_number || null,
-					manager_at: manager.at,
-					manager_id: manager.manager_id,
-					team: manager.team,
+					ext: claimedManager.extension_number || null,
+					manager_at: claimedManager.at,
+					manager_id: claimedManager.manager_id,
+					team: claimedManager.team,
+					has_any_order: hasAnyOrder,
+					has_recent_order: hasRecentOrder,
 				}
 
-				try {
-					const dedupKey = `new_inbound_lead_${clientNumericId}`
-					const lastSent = recentRepeatClients.get(dedupKey)
-					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
-						logger.info(
-							`⏭️ Дедупликация: new_inbound_lead (SMS) для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`
-						)
-					} else {
-						recentRepeatClients.set(dedupKey, Date.now())
-						await sendToQueue('new_inbound_lead', inboundLeadData)
-						logger.info(
-							`✅ new_inbound_lead отправлен для SMS client=${clientNumericId}, manager=${manager.at}`
-						)
-					}
-				} catch (queueError) {
-					logger.error(
-						`❌ Ошибка отправки в new_inbound_lead: ${queueError.message}`
+				const dedupKey = `new_inbound_lead_${clientNumericId}`
+				const lastSent = recentRepeatClients.get(dedupKey)
+				if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+					logger.info(`⏭️ Дедупликация: уже отправлен`)
+				} else {
+					recentRepeatClients.set(dedupKey, Date.now())
+					await sendToQueue('new_inbound_lead', inboundLeadData)
+					logger.info(
+						`✅ SMS DM отправлен @${claimedManager.at} (client=${clientNumericId})`
 					)
 				}
-
-			} else {
-				logger.warn(
-					`⚠️ SMS received but manager not found for phone=${managerPhone}, skipping new_inbound_lead`
+			}
+			// No claimed manager, but manager found from to_members → DM
+			else if (responsibleManager && responsibleManager.at) {
+				logger.info(
+					`📱 Incoming SMS - sending DM to @${responsibleManager.at}`
 				)
+
+				const inboundLeadData = {
+					client_id: clientId,
+					client_numeric_id: clientNumericId,
+					customer_number: phoneNumber,
+					message: message,
+					lead_type: 'inbound_sms',
+					ext: responsibleManager.extension_number || null,
+					manager_at: responsibleManager.at,
+					manager_id: responsibleManager.manager_id,
+					team: responsibleManager.team,
+					has_any_order: hasAnyOrder,
+					has_recent_order: hasRecentOrder,
+				}
+
+				const dedupKey = `new_inbound_lead_${clientNumericId}`
+				const lastSent = recentRepeatClients.get(dedupKey)
+				if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+					logger.info(`⏭️ Дедупликация: уже отправлен`)
+				} else {
+					recentRepeatClients.set(dedupKey, Date.now())
+					await sendToQueue('new_inbound_lead', inboundLeadData)
+					logger.info(
+						`✅ SMS DM отправлен @${responsibleManager.at} (client=${clientNumericId})`
+					)
+				}
+			}
+			// No manager at all → group + claim button
+			else {
+				logger.info(
+					`📱 Incoming SMS - no manager, sending to group`
+				)
+
+				const dedupKey = `sms_${clientNumericId}`
+				const lastSent = recentRepeatClients.get(dedupKey)
+				if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+					logger.info(`⏭️ Дедупликация: SMS lead уже отправлен`)
+				} else {
+					recentRepeatClients.set(dedupKey, Date.now())
+
+					const smsLeadData = {
+						client_id: clientId,
+						client_numeric_id: clientNumericId,
+						customer_number: phoneNumber,
+						orders: allOrders,
+						message: message,
+						smsType: smsType,
+						date_time: dateTime,
+						team: null,
+						manager_at: null,
+						zoomData: data
+					}
+
+					if (isGatewayEnabled()) {
+						try {
+							await sendRepeatSmsNotification(smsLeadData)
+						} catch (gatewayError) {
+							await sendToQueue('repeat_sms_in', smsLeadData)
+						}
+					} else {
+						await sendToQueue('repeat_sms_in', smsLeadData)
+					}
+				}
 			}
 		}
 
-		try {
-			await tryAutoClaimOpenLeadFromSms({
-				clientId: clientNumericId,
-				phone: phoneNumber,
-				managerPhone,
-				smsType,
-				ownerId,
-				messageId,
-			})
-		} catch (autoClaimError) {
-			logger.warn(
-				`⚠️ Auto-claim shadow skipped for sms client=${clientNumericId}: ${autoClaimError.message}`
-			)
+		// ============================================================
+		// OUTGOING SMS LOGIC - auto-claim open leads
+		// ============================================================
+		if (smsType === 'outgoing') {
+			try {
+				await tryAutoClaimOpenLeadFromSms({
+					clientId: clientNumericId,
+					phone: phoneNumber,
+					managerPhone: smsData.owner?.phone_number || null,
+					smsType,
+					ownerId,
+					messageId,
+				})
+			} catch (autoClaimError) {
+				logger.warn(
+					`⚠️ Auto-claim skipped for SMS client=${clientNumericId}: ${autoClaimError.message}`
+				)
+			}
 		}
 
 		return {

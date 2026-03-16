@@ -627,9 +627,9 @@ async def handle_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def zoom_new_inbound_lead(data):
     """
-    Handle new inbound leads: 
-    - New SMS with extension info → auto-claimed, DM to manager
-    - Answered inbound call → new lead auto-claimed, DM to manager
+    Handle inbound leads with auto-claim:
+    - Answered inbound call → DM to manager who answered
+    - New SMS with extension info → DM to manager
     
     This creates a pre-claimed lead directly in the manager's DM,
     no group message, no Claim button.
@@ -637,13 +637,14 @@ async def zoom_new_inbound_lead(data):
     try:
         client_numeric_id = data.get("client_numeric_id") or data.get("client_id")
         customer_number = data.get("customer_number", "")
-        lead_type = data.get("lead_type", "inbound_sms")  # "inbound_sms" or "answered_call"
-        message_text = data.get("message", "")  # For SMS
-        call_result = data.get("result", "")    # For calls
-        ext = data.get("ext", "")               # Extension that received the call/SMS
+        lead_type = data.get("lead_type", "inbound_sms")
+        message_text = data.get("message", "")
+        call_result = data.get("result", "")
+        ext = data.get("ext", "")
         manager_at = data.get("manager_at", "")
+        has_any_order = data.get("has_any_order", False)
+        has_recent_order = data.get("has_recent_order", False)
         
-        # Find manager by at username
         manager = users_db.find_one({"at": manager_at}) if manager_at else None
         
         if not manager:
@@ -652,9 +653,8 @@ async def zoom_new_inbound_lead(data):
         
         manager_chat_id = manager.get("chat_id")
         
-        # Apply admin override if set - send to GROUP instead of DM
         if AUTO_CLAIM_ADMIN:
-            manager_chat_id = CHAT_ID  # Send to group
+            manager_chat_id = CHAT_ID
             redirect_note = f"\n\n🔄 [REDIRECTED from @{manager_at}]"
         else:
             redirect_note = ""
@@ -663,10 +663,21 @@ async def zoom_new_inbound_lead(data):
             print(f"⚠️ [new_inbound_lead] Manager @{manager_at} has no chat_id, skipping")
             return
         
-        # Build message
+        # Determine client status label
+        if has_recent_order:
+            client_status = "🟢 АКТИВНЫЙ КЛИЕНТ"
+        elif has_any_order:
+            client_status = "🟡 ПОВТОРНЫЙ КЛИЕНТ"
+        else:
+            client_status = "🔵 НОВЫЙ КЛИЕНТ"
+        
+        # Build message based on type
         if lead_type == "inbound_sms":
             content_text = f"Текст: {message_text}" if message_text else ""
-            lead_label = "💬 Новый SMS"
+            lead_label = "💬 Входящее SMS"
+        elif lead_type == "active_call":
+            content_text = f"Статус: {call_result}" if call_result else ""
+            lead_label = "☎️ Звонок от активного клиента"
         else:
             content_text = f"Статус: {call_result}" if call_result else ""
             lead_label = "☎️ Входящий звонок"
@@ -676,7 +687,8 @@ async def zoom_new_inbound_lead(data):
         await throttled_send_message(
             chat_id=manager_chat_id,
             text=(
-                f"{lead_label} — НОВЫЙ ЛИД\n"
+                f"{lead_label}\n"
+                f"{client_status}\n"
                 f"Клиент: #c{client_numeric_id}\n"
                 f"Phone: {customer_number}"
                 f"{ext_info}\n"
@@ -686,11 +698,11 @@ async def zoom_new_inbound_lead(data):
             parse_mode="HTML",
         )
         
-        # Create a pre-claimed form so it's tracked in the system
+        # Create a pre-claimed form
         filled_forms_db.insert_one({
             "chat_team": "TEST",
             "team_": "test_mini_bot",
-            "cpmn_name": "inbound_sms" if lead_type == "inbound_sms" else "answered_call",
+            "cpmn_name": lead_type,
             "client_id": client_numeric_id,
             "telephone": customer_number,
             "manager_at": manager_at,
@@ -702,7 +714,7 @@ async def zoom_new_inbound_lead(data):
             "messages": {},
         })
         
-        print(f"✅ [new_inbound_lead] Created and sent DM to @{manager_at} for #{client_numeric_id}")
+        print(f"✅ [new_inbound_lead] DM sent to @{manager_at} for #c{client_numeric_id} ({client_status})")
         
     except Exception as e:
         print(f"❌ [new_inbound_lead] Error: {e}")

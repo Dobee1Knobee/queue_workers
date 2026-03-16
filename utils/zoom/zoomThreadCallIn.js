@@ -9,13 +9,68 @@ const {
 	sendRepeatCallNotification,
 	sendMissedCallNotification,
 } = require('../gatewayFlow')
-const { tryAutoClaimOpenLeadFromCall } = require('../autoClaim')
+const { tryAutoClaimOpenLeadFromCall, resolveEffectiveManager, findUserByAt } = require('../autoClaim')
+const SHIFT_REPLACEMENTS = require('../../config/shiftReplacements')
 
 let callConnection = null
 let CallModel = null
-
-// Подключение к базе данных tvmount для работы с fastQuiz
 let tvmountConnection = null
+
+const REPEAT_CONTACT_WINDOW_DAYS = 14
+
+const findClaimedManagerForClient = async (clientId, tvmountConn) => {
+	if (!clientId) return null
+	
+	const cutoff = new Date(Date.now() - REPEAT_CONTACT_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+	const FilledFormsModel = tvmountConn.models.filled_forms || tvmountConn.model(
+		'filled_forms',
+		new mongoose.Schema({}, { strict: false }),
+		'filled_forms'
+	)
+	
+	const form = await FilledFormsModel.findOne({
+		client_id: clientId,
+		manager_at: { $exists: true, $ne: null, $ne: '' },
+		date: { $gte: cutoff.toISOString() },
+	}).sort({ date: -1 })
+	
+	if (!form) return null
+	
+	const managerAt = form.get('manager_at')
+	if (!managerAt) return null
+	
+	const UsersModel = tvmountConn.models.users || tvmountConn.model(
+		'users',
+		new mongoose.Schema({}, { strict: false }),
+		'users'
+	)
+	
+	const managerDoc = await UsersModel.findOne({ at: managerAt })
+	if (!managerDoc) return null
+	
+	// Check if manager is working
+	if (managerDoc.working !== false) {
+		return managerDoc
+	}
+	
+	// Manager not working - check for replacement
+	const replacementAt = SHIFT_REPLACEMENTS[managerAt]
+	if (!replacementAt) {
+		return managerDoc // Return original even if not working
+	}
+	
+	const replacementDoc = await UsersModel.findOne({ at: replacementAt })
+	if (!replacementDoc || replacementDoc.working === false) {
+		return managerDoc // Replacement not available, return original
+	}
+	
+	// Return replacement manager
+	return {
+		...replacementDoc.toObject(),
+		delegated_from_at: managerAt,
+		delegated_from_manager_id: managerDoc.manager_id,
+	}
+}
 
 const normalizeDigits = value => {
 	if (value === null || value === undefined) return ''
@@ -313,9 +368,10 @@ const zoomThreadCallIn = async data => {
 
 				const hasAnyOrder = allOrders.length > 0
 				const hasRecentOrder = recentOrders.length > 0
-				const isRepeatCall = hasAnyOrder && !hasRecentOrder && direction === 'inbound'
 				const isMissedInboundCall =
 					direction === 'inbound' && MISSED_CALL_RESULTS.has(normalizeCallResult(result))
+				const isAnsweredInboundCall =
+					direction === 'inbound' && !MISSED_CALL_RESULTS.has(normalizeCallResult(result))
 
 			logger.info(
 				`🔍 Найдено заказов в таблице хендимен (orders): за 2 недели=${recentOrders.length}, всего=${allOrders.length}`
@@ -340,172 +396,192 @@ const zoomThreadCallIn = async data => {
 
 		logger.info(`✅ Call успешно сохранен в БД с _id: ${call._id}`)
 
-					if (isMissedInboundCall) {
-						logger.info(
-							`☎️ Missed inbound call detected (result=${result || 'unknown'}) — отправляем claim lead`
-						)
+		// ============================================================
+		// INBOUND CALL LOGIC
+		// ============================================================
+		if (direction === 'inbound') {
+			// First check: does client have a claimed manager (< 2 weeks)?
+			const claimedManager = await findClaimedManagerForClient(clientNumericId, tvmountConn)
+			
+			// 1. MISSED CALL - no one answered
+			if (isMissedInboundCall) {
+				logger.info(
+					`☎️ Missed inbound call (result=${result || 'unknown'})`
+				)
 
-						const dedupKey = `missed_call_${clientNumericId}`
-						const lastSent = recentRepeatClients.get(dedupKey)
-						if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
-							logger.info(
-								`⏭️ Дедупликация: missed call lead для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`
-							)
-						} else {
-							recentRepeatClients.set(dedupKey, Date.now())
-
-							const missedCallData = {
-								client_id: clientId,
-								client_numeric_id: clientNumericId,
-								customer_number: customerNumber,
-								orders: allOrders,
-								direction,
-								ext,
-								duration,
-								result,
-								date_time: callEndDate,
-								lead_type: 'missed_call',
-								team: responsibleManager?.team || null,
-								manager_at: responsibleManager?.at || null,
-								manager_id: responsibleManager?.manager_id || null,
-								zoomData: data,
-							}
-
-							if (isGatewayEnabled()) {
-								try {
-									await sendMissedCallNotification(missedCallData)
-									logger.info(
-										`✅ missed_call lead отправлен через Telegram Gateway (client=${clientNumericId})`
-									)
-								} catch (gatewayError) {
-									logger.error(
-										`❌ Ошибка Telegram Gateway для missed_call lead: ${gatewayError.message}`
-									)
-									await sendToQueue('repeat_call_in', missedCallData)
-									logger.info(
-										'↩️ Fallback: missed_call lead отправлен в RabbitMQ очередь repeat_call_in'
-									)
-								}
-							} else {
-								await sendToQueue('repeat_call_in', missedCallData)
-							}
-						}
-					} else if (isRepeatCall) {
-						logger.info(`✅ Repeat call (последний заказ старше 2 недель), входящий: ${customerNumber}`)
-
-				// Dedup: skip if we already sent repeat for this client recently
-				const dedupKey = `repeat_call_${clientNumericId}`
-				const lastSent = recentRepeatClients.get(dedupKey)
-			if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
-				logger.info(`⏭️ Дедупликация: repeat_call_in для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`)
-			} else {
-				recentRepeatClients.set(dedupKey, Date.now())
-
-				// Отправляем сообщение в RabbitMQ о повторном звонке
-					const repeatCallData = {
-						client_id: clientId,
-						client_numeric_id: clientNumericId,
-						customer_number: customerNumber,
-						orders: allOrders,
-						direction: direction,
-						ext: ext,
-						duration: duration,
-						result: result,
-						date_time: callEndDate,
-						team: responsibleManager?.team || null,
-						manager_at: responsibleManager?.at || null,
-						manager_id: responsibleManager?.manager_id || null,
-						zoomData: data
-					}
-
-					if (isGatewayEnabled()) {
-						try {
-							await sendRepeatCallNotification(repeatCallData)
-							logger.info(
-								`✅ repeat_call_in отправлен через Telegram Gateway (client=${clientNumericId})`
-							)
-						} catch (gatewayError) {
-							logger.error(
-								`❌ Ошибка Telegram Gateway для repeat_call_in: ${gatewayError.message}`
-							)
-							await sendToQueue('repeat_call_in', repeatCallData)
-							logger.info(
-								`↩️ Fallback: repeat_call_in отправлен в RabbitMQ очередь`
-							)
-						}
-					} else {
-						await sendToQueue('repeat_call_in', repeatCallData)
-					}
-				}
-				} else {
+				// Has claimed manager → DM directly
+				if (claimedManager && claimedManager.at) {
 					logger.info(
-						`⏭️ REPEAT_ONLY: non-repeat call пропущен (direction=${direction}, hasAnyOrder=${hasAnyOrder}, hasRecentOrder=${hasRecentOrder})`
+						`📬 Client has claimed manager @${claimedManager.at} - sending DM`
 					)
-				}
 
-				// Check if this is an answered inbound call (new lead)
-				// Send to new_inbound_lead queue for direct-to-DM routing
-				const normalizedCallResult = normalizeCallResult(result)
-				const isAnsweredInbound = 
-					direction === 'inbound' &&
-					!MISSED_CALL_RESULTS.has(normalizedCallResult) &&
-					responsibleManager &&
-					responsibleManager.at &&
-					!hasRecentOrder // Only for new clients, not repeats
-
-				if (isAnsweredInbound) {
 					const inboundLeadData = {
 						client_id: clientId,
 						client_numeric_id: clientNumericId,
 						customer_number: customerNumber,
-						lead_type: 'answered_call',
+						lead_type: 'missed_call',
+						result: result,
+						ext: ext,
+						manager_at: claimedManager.at,
+						manager_id: claimedManager.manager_id,
+						team: claimedManager.team,
+						has_any_order: hasAnyOrder,
+						has_recent_order: hasRecentOrder,
+					}
+
+					const dedupKey = `new_inbound_lead_${clientNumericId}`
+					const lastSent = recentRepeatClients.get(dedupKey)
+					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+						logger.info(`⏭️ Дедупликация: уже отправлен`)
+					} else {
+						recentRepeatClients.set(dedupKey, Date.now())
+						await sendToQueue('new_inbound_lead', inboundLeadData)
+						logger.info(
+							`✅ missed_call DM отправлен @${claimedManager.at} (client=${clientNumericId})`
+						)
+					}
+				}
+				// No claimed manager → group + claim button
+				else {
+					logger.info(
+						`📬 No claimed manager - sending to group`
+					)
+
+					const dedupKey = `missed_call_${clientNumericId}`
+					const lastSent = recentRepeatClients.get(dedupKey)
+					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+						logger.info(`⏭️ Дедупликация: уже отправлен`)
+					} else {
+						recentRepeatClients.set(dedupKey, Date.now())
+
+						const missedCallData = {
+							client_id: clientId,
+							client_numeric_id: clientNumericId,
+							customer_number: customerNumber,
+							orders: allOrders,
+							direction,
+							ext,
+							duration,
+							result,
+							date_time: callEndDate,
+							lead_type: 'missed_call',
+							team: responsibleManager?.team || null,
+							manager_at: responsibleManager?.at || null,
+							manager_id: responsibleManager?.manager_id || null,
+							zoomData: data,
+						}
+
+						if (isGatewayEnabled()) {
+							try {
+								await sendMissedCallNotification(missedCallData)
+							} catch (gatewayError) {
+								await sendToQueue('repeat_call_in', missedCallData)
+							}
+						} else {
+							await sendToQueue('repeat_call_in', missedCallData)
+						}
+					}
+				}
+			}
+			// 2. ANSWERED CALL - someone picked up
+			else if (isAnsweredInboundCall) {
+				// Manager answered → auto-claim + DM
+				if (responsibleManager && responsibleManager.at) {
+					logger.info(
+						`📞 Answered inbound call - auto-claiming to @${responsibleManager.at}`
+					)
+
+					const inboundLeadData = {
+						client_id: clientId,
+						client_numeric_id: clientNumericId,
+						customer_number: customerNumber,
+						lead_type: hasRecentOrder ? 'active_call' : 'answered_call',
 						result: result,
 						ext: ext,
 						manager_at: responsibleManager.at,
 						manager_id: responsibleManager.manager_id,
 						team: responsibleManager.team,
 						duration: duration,
+						has_recent_order: hasRecentOrder,
+						has_any_order: hasAnyOrder,
 					}
 
-					try {
-						const dedupKey = `new_inbound_lead_${clientNumericId}`
-						const lastSent = recentRepeatClients.get(dedupKey)
-						if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
-							logger.info(
-								`⏭️ Дедупликация: new_inbound_lead для клиента ${clientNumericId} уже отправлен ${Math.round((Date.now() - lastSent) / 1000)}с назад, пропускаем`
-							)
-						} else {
-							recentRepeatClients.set(dedupKey, Date.now())
-							await sendToQueue('new_inbound_lead', inboundLeadData)
-							logger.info(
-								`✅ new_inbound_lead отправлен для answered call client=${clientNumericId}, manager=${responsibleManager.at}`
-							)
-						}
-					} catch (queueError) {
-						logger.error(
-							`❌ Ошибка отправки в new_inbound_lead: ${queueError.message}`
+					const dedupKey = `new_inbound_lead_${clientNumericId}`
+					const lastSent = recentRepeatClients.get(dedupKey)
+					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+						logger.info(
+							`⏭️ Дедупликация: inbound lead для клиента ${clientNumericId} уже отправлен`
+						)
+					} else {
+						recentRepeatClients.set(dedupKey, Date.now())
+						await sendToQueue('new_inbound_lead', inboundLeadData)
+						logger.info(
+							`✅ new_inbound_lead отправлен для answered call client=${clientNumericId}, manager=${responsibleManager.at}`
 						)
 					}
-
 				}
-
-				try {
-					await tryAutoClaimOpenLeadFromCall({
-						clientId: clientNumericId,
-						phone: customerNumber,
-						managerPhone:
-							direction === 'outbound' ? caller_number : callee_number,
-						direction,
-						duration,
-						result,
-						responsibleManager,
-						callId: log?.id || log?.call_id || null,
-					})
-				} catch (autoClaimError) {
-					logger.warn(
-						`⚠️ Auto-claim shadow skipped for call client=${clientNumericId}: ${autoClaimError.message}`
+				// No manager found - this shouldn't happen for queue calls, but handle it
+				else {
+					logger.info(
+						`📞 Answered inbound call but no manager found - sending to group`
 					)
+
+					const dedupKey = `repeat_call_${clientNumericId}`
+					const lastSent = recentRepeatClients.get(dedupKey)
+					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
+						logger.info(`⏭️ Дедупликация: repeat_call уже отправлен`)
+					} else {
+						recentRepeatClients.set(dedupKey, Date.now())
+
+						const repeatCallData = {
+							client_id: clientId,
+							client_numeric_id: clientNumericId,
+							customer_number: customerNumber,
+							orders: allOrders,
+							direction: direction,
+							ext: ext,
+							duration: duration,
+							result: result,
+							date_time: callEndDate,
+							team: null,
+							manager_at: null,
+							manager_id: null,
+							zoomData: data
+						}
+
+						if (isGatewayEnabled()) {
+							try {
+								await sendRepeatCallNotification(repeatCallData)
+							} catch (gatewayError) {
+								await sendToQueue('repeat_call_in', repeatCallData)
+							}
+						} else {
+							await sendToQueue('repeat_call_in', repeatCallData)
+						}
+					}
 				}
+			}
+		}
+
+		// OUTBOUND CALL - auto-claim open leads if manager calls back
+		if (direction === 'outbound') {
+			try {
+				await tryAutoClaimOpenLeadFromCall({
+					clientId: clientNumericId,
+					phone: customerNumber,
+					managerPhone: caller_number,
+					direction,
+					duration,
+					result,
+					responsibleManager,
+					callId: log?.id || log?.call_id || null,
+				})
+			} catch (autoClaimError) {
+				logger.warn(
+					`⚠️ Auto-claim skipped for outbound call client=${clientNumericId}: ${autoClaimError.message}`
+				)
+			}
+		}
 	} catch (error) {
 		logger.error(
 			{
@@ -516,12 +592,6 @@ const zoomThreadCallIn = async data => {
 			'❌ Ошибка в zoomThreadCallIn'
 		)
 		return { success: false, message: 'Error processing call' }
-	}
-
-	if (direction === 'outbound') {
-		// outbound обработка
-	} else if (direction === 'inbound') {
-		// inbound обработка
 	}
 
 	return { success: true, callData }
