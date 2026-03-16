@@ -397,11 +397,15 @@ const extractGatewayCallback = payload => {
 	return {
 		callbackQueryId: callbackQuery.id || null,
 		callbackData: callbackQuery.data || null,
-		messageId: callbackQuery.messageId || callbackMessage.message_id || null,
+		messageId:
+			callbackQuery.messageId ||  // Gateway format (direct)
+			callbackMessage.message_id ||  // Telegram format (inside message)
+			null,
 		chatId:
 			callbackMessage?.chatId ||
 			callbackMessage?.chat?.id ||
 			payload?.message?.chatId ||
+			callbackQuery?.chatId ||  // Gateway might send chatId directly
 			null,
 		fromId: callbackQuery.fromId || callbackFrom.id || null,
 		username: callbackFrom.username || null,
@@ -429,21 +433,30 @@ const formatClaimDm = ({ form, clientRef, managerAt }) => {
 
 const handleGatewayTelegramEvent = async payload => {
 	const updateType = payload?.updateType || 'unknown'
+	logger.info(`📩 handleGatewayTelegramEvent: updateType=${updateType}`)
+	logger.info(`📩 Full payload: ${JSON.stringify(payload, null, 2)}`)
+	
 	if (updateType !== 'callback_query') {
 		return { handled: false, reason: `ignored updateType=${updateType}` }
 	}
 
 	const callback = extractGatewayCallback(payload)
+	logger.info(`📩 Extracted callback: ${JSON.stringify(callback)}`)
+	
 	if (!callback.callbackData || !callback.callbackData.startsWith('claim:zoom:')) {
 		return { handled: false, reason: 'ignored non-claim callback' }
 	}
 	const claimClientId = parseClaimClientId(callback.callbackData)
+	logger.info(`📩 claimClientId: ${claimClientId}`)
 
 	const messageId = Number(callback.messageId)
 	if (!Number.isFinite(messageId)) {
+		logger.error(`❌ Invalid messageId: ${callback.messageId}`)
 		await safeAnswerCallback(callback.callbackQueryId, 'Invalid message', true)
 		return { handled: true, reason: 'invalid messageId' }
 	}
+
+	logger.info(`🔍 Looking for form with messageId=${messageId}`)
 
 	const FilledFormsModel = await getCollectionModel('filled_forms')
 	const UsersModel = await getCollectionModel('users')
@@ -469,6 +482,8 @@ const handleGatewayTelegramEvent = async payload => {
 			$or: buildValueVariants(callback.chatId).map(value => ({ test_chat_id: value })),
 		})
 	}
+
+	logger.info(`🔍 Form query: ${JSON.stringify(formQuery)}`)
 
 	const form = await FilledFormsModel.findOne(formQuery).sort({ _id: -1 })
 
