@@ -31,9 +31,29 @@ app.get('/health', (req, res) => {
 		gateway_enabled: isGatewayEnabled(),
 		gateway_url: process.env.TELEGRAM_GATEWAY_URL || 'not set',
 		gateway_chat_id: process.env.TELEGRAM_GATEWAY_CHAT_ID || 'not set',
+		gateway_caller_id: process.env.TELEGRAM_GATEWAY_CALLER_ID || 'not set',
+		gateway_api_key_set: !!process.env.TELEGRAM_GATEWAY_API_KEY,
 		rabbit_connected: !!rabbitState.connection,
 		node_env: process.env.NODE_ENV || 'development',
 	})
+})
+
+app.get('/test-gateway', async (req, res) => {
+	const { gatewayPostInternal, makeIdempotencyKey, getGatewayChatTarget } = require('./utils/gatewayFlow')
+	try {
+		const target = getGatewayChatTarget()
+		const result = await gatewayPostInternal({
+			operationType: 'send_message',
+			idempotencyKey: makeIdempotencyKey(`test-${Date.now()}`),
+			payload: {
+				...target,
+				text: '🧪 Test message from queue_workers',
+			},
+		})
+		res.json({ success: true, result, target })
+	} catch (error) {
+		res.status(500).json({ success: false, error: error.message })
+	}
 })
 
 // Endpoint для приема webhook SMS

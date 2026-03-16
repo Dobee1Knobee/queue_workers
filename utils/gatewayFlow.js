@@ -132,7 +132,7 @@ const gatewayPostInternal = async ({ operationType, payload, idempotencyKey, cor
 		payload,
 	}
 	logger.info(
-		`➡️ [gateway] op=${operationType} idempotencyKey=${requestBody.idempotencyKey}`
+		`➡️ [gateway] op=${operationType} idempotencyKey=${requestBody.idempotencyKey} payload=${JSON.stringify(payload)}`
 	)
 
 	const headers = {
