@@ -145,9 +145,14 @@ app.post('/webhook/call', (req, res) => {
 
 // Endpoint для входящих событий от Telegram Gateway
 app.post('/internal/telegram/events', async (req, res) => {
+	console.log('📩 POST /internal/telegram/events received')
+	console.log('📩 Headers:', JSON.stringify(req.headers, null, 2))
+	console.log('📩 Body:', JSON.stringify(req.body, null, 2))
+	
 	try {
 		const headerCheck = verifyGatewayEventHeaders(req.headers || {})
 		if (!headerCheck.valid) {
+			console.log('❌ Header check failed:', headerCheck)
 			return res.status(headerCheck.status).json({
 				ok: false,
 				error: headerCheck.message,
@@ -155,9 +160,11 @@ app.post('/internal/telegram/events', async (req, res) => {
 		}
 
 		const result = await handleGatewayTelegramEvent(req.body || {})
+		console.log('✅ handleGatewayTelegramEvent result:', JSON.stringify(result))
 		return res.status(200).json({ ok: true, ...result })
 	} catch (error) {
 		console.error('❌ Ошибка обработки /internal/telegram/events:', error.message)
+		console.error('❌ Stack:', error.stack)
 		return res.status(500).json({
 			ok: false,
 			error: error.message || 'internal error',

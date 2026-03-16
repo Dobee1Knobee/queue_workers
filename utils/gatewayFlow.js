@@ -304,6 +304,10 @@ const sendLeadNotificationToGateway = async ({ type, leadData }) => {
 
 	const telegramMessageId = sendResp?.deliveryResult?.messageId
 	const telegramChatId = sendResp?.deliveryResult?.chatId
+	
+	logger.info(`📤 Gateway response: ${JSON.stringify(sendResp)}`)
+	logger.info(`📤 telegramMessageId=${telegramMessageId}, telegramChatId=${telegramChatId}`)
+	
 	if (!telegramMessageId) {
 		logger.warn(
 			`⚠️ Gateway send_message accepted without deliveryResult.messageId (type=${type}, client=${clientNumericId})`
@@ -312,7 +316,7 @@ const sendLeadNotificationToGateway = async ({ type, leadData }) => {
 	}
 
 	const FilledFormsModel = await getCollectionModel('filled_forms')
-	await FilledFormsModel.create({
+	const formDoc = {
 		chat_team: 'TEST',
 		team_: 'test_gateway',
 		cpmn_name:
@@ -327,7 +331,11 @@ const sendLeadNotificationToGateway = async ({ type, leadData }) => {
 		type: 'TV',
 		messages: {},
 		source: 'telegram_gateway',
-	})
+	}
+	logger.info(`📝 Creating form in filled_forms: ${JSON.stringify(formDoc)}`)
+	
+	await FilledFormsModel.create(formDoc)
+	logger.info(`✅ Form created with chat_message_id=${telegramMessageId}`)
 
 	return sendResp
 }
