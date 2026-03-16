@@ -316,6 +316,8 @@ const sendDirectLeadNotificationToGateway = async leadData => {
 	const managerAt = leadData.manager_at
 	const managerChatId = leadData.manager_chat_id
 
+	logger.info(`📤 sendDirectLeadNotificationToGateway: client=${clientNumericId}, manager_at=${managerAt}`)
+
 	if (!managerAt) {
 		logger.warn(`⚠️ Cannot send direct lead to gateway: manager_at missing client=${clientNumericId}`)
 		return null
@@ -337,16 +339,21 @@ const sendDirectLeadNotificationToGateway = async leadData => {
 	let targetChatId = managerChatId || (await getManagerChatIdByAt(managerAt))
 	let redirectionTag = ''
 
+	logger.info(`📤 Initial targetChatId: ${targetChatId}, REDIRECT_DM_ENABLED: ${REDIRECT_DM_ENABLED}`)
+
 	if (REDIRECT_DM_ENABLED) {
 		const groupTarget = getGatewayChatTarget()
 		targetChatId = groupTarget.chatId || groupTarget.chatAlias
 		redirectionTag = `🕒 [REDIRECTED DM for @${managerAt}]\n`
+		logger.info(`📤 Redirecting to group: ${targetChatId}`)
 	}
 
 	if (!targetChatId) {
 		logger.warn(`⚠️ Manager @${managerAt} has no chatID and no group fallback, cannot send direct lead`)
 		return null
 	}
+
+	logger.info(`📤 Sending message to chatId=${targetChatId}, text length=${text.length}`)
 
 	return gatewayPostInternal({
 		operationType: 'send_message',

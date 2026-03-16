@@ -413,8 +413,11 @@ const zoomThreadCallIn = async data => {
 		// INBOUND CALL LOGIC
 		// ============================================================
 		if (direction === 'inbound') {
+			logger.info('📞 INBOUND CALL - starting routing logic')
+			
 			// First check: does client have a claimed manager (< 2 weeks)?
 			const claimedManager = await findClaimedManagerForClient(clientNumericId, tvmountConn)
+			logger.info(`📞 Claimed manager: ${claimedManager ? JSON.stringify(claimedManager) : 'NULL'}`)
 			
 			// 1. MISSED CALL - no one answered
 			if (isMissedInboundCall) {
@@ -452,10 +455,19 @@ const zoomThreadCallIn = async data => {
 						logger.info(`⏭️ Дедупликация: уже отправлен`)
 					} else {
 						recentRepeatClients.set(dedupKey, Date.now())
+						logger.info(`🚀 Sending to gateway: isGatewayEnabled=${isGatewayEnabled()}`)
 						
 						if (isGatewayEnabled()) {
-							await sendDirectLeadNotificationToGateway(inboundLeadData)
+							logger.info(`🚀 Calling sendDirectLeadNotificationToGateway...`)
+							try {
+								const result = await sendDirectLeadNotificationToGateway(inboundLeadData)
+								logger.info(`✅ Gateway response: ${JSON.stringify(result)}`)
+							} catch (gwError) {
+								logger.error(`❌ Gateway error: ${gwError.message}`)
+								logger.error(`❌ Stack: ${gwError.stack}`)
+							}
 						} else {
+							logger.info(`🚀 Gateway disabled - sending to queue`)
 							await sendToQueue('new_inbound_lead', inboundLeadData)
 						}
 
@@ -476,6 +488,7 @@ const zoomThreadCallIn = async data => {
 						logger.info(`⏭️ Дедупликация: уже отправлен`)
 					} else {
 						recentRepeatClients.set(dedupKey, Date.now())
+						logger.info(`🚀 Sending missed call to gateway: isGatewayEnabled=${isGatewayEnabled()}`)
 
 						const missedCallData = {
 							client_id: clientId,
