@@ -353,8 +353,11 @@ const sendDirectLeadNotificationToGateway = async leadData => {
 		return null
 	}
 
+	const leadType = leadData.lead_type || ''
+	const messageType = leadType === 'missed_call' ? 'missed_call' : leadType === 'inbound_sms' ? 'sms' : 'direct'
+	
 	const text = buildLeadMessage({
-		type: leadData.lead_type === 'missed_call' ? 'missed_call' : 'direct',
+		type: messageType,
 		clientNumericId,
 		customerNumber: leadData.customer_number,
 		recentOrders: leadData.orders || [],
