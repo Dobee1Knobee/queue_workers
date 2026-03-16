@@ -24,6 +24,18 @@ app.get('/', (req, res) => {
 	res.send('Hello World')
 })
 
+app.get('/health', (req, res) => {
+	const { isGatewayEnabled } = require('./utils/gatewayFlow')
+	res.json({
+		status: 'ok',
+		gateway_enabled: isGatewayEnabled(),
+		gateway_url: process.env.TELEGRAM_GATEWAY_URL || 'not set',
+		gateway_chat_id: process.env.TELEGRAM_GATEWAY_CHAT_ID || 'not set',
+		rabbit_connected: !!rabbitState.connection,
+		node_env: process.env.NODE_ENV || 'development',
+	})
+})
+
 // Endpoint для приема webhook SMS
 app.post('/webhook/sms', (req, res) => {
 	console.log('📨 Webhook SMS получен:', req.body)
@@ -144,15 +156,18 @@ const startRabbitConsumers = async () => {
 			async message => {
 				if (message === null) return
 				try {
+					console.log('📞 Call сообщение получено из очереди')
 					if (isDev && devProcessingDelayMs > 0) {
 						await sleep(devProcessingDelayMs)
 					}
 					const data = JSON.parse(message.content.toString())
+					console.log('📞 Call data:', JSON.stringify(data, null, 2))
 					await zoomThreadCallIn(data)
 					safeAck(channelCall, message, 'call_in_test')
 					console.log('✅ Call сообщение обработано и подтверждено')
 				} catch (error) {
 					console.error('❌ Ошибка обработки Call:', error.message)
+					console.error('❌ Stack:', error.stack)
 					safeNack(channelCall, message, 'call_in_test')
 				}
 			},
@@ -164,15 +179,18 @@ const startRabbitConsumers = async () => {
 			async message => {
 				if (message === null) return
 				try {
+					console.log('💬 SMS сообщение получено из очереди')
 					if (isDev && devProcessingDelayMs > 0) {
 						await sleep(devProcessingDelayMs)
 					}
 					const data = JSON.parse(message.content.toString())
+					console.log('💬 SMS data:', JSON.stringify(data, null, 2))
 					await zoomThreadSmsIn(data)
 					safeAck(channelSms, message, 'sms_in_test')
 					console.log('✅ SMS сообщение обработано и подтверждено')
 				} catch (error) {
 					console.error('❌ Ошибка обработки SMS:', error.message)
+					console.error('❌ Stack:', error.stack)
 					safeNack(channelSms, message, 'sms_in_test')
 				}
 			},
