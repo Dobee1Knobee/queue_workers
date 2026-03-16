@@ -56,7 +56,7 @@ const buildValueVariants = value => {
 
 const parseClaimClientId = callbackData => {
 	if (typeof callbackData !== 'string') return null
-	if (callbackData.startsWith('claim:z:')) {
+	if (callbackData.startsWith('zoom_claim:')) {
 		const parts = callbackData.split(':')
 		return parts[parts.length - 1] // The last part is the client ID
 	}
@@ -261,7 +261,7 @@ const sendLeadNotificationToGateway = async ({ type, leadData }) => {
 			text,
 			replyMarkup: {
 				inlineKeyboard: [
-					[{ text: 'Claim', callbackData: `claim:z:${claimType}:${clientNumericId}` }],
+					[{ text: 'Claim', callbackData: `zoom_claim:${claimType}:${clientNumericId}` }],
 				],
 			},
 		},
@@ -399,7 +399,7 @@ const handleGatewayTelegramEvent = async payload => {
 	}
 
 	const callback = extractGatewayCallback(payload)
-	if (!callback.callbackData || !callback.callbackData.startsWith('claim:')) {
+	if (!callback.callbackData || (!callback.callbackData.startsWith('claim:') && !callback.callbackData.startsWith('zoom_claim:'))) {
 		return { handled: false, reason: 'ignored non-claim callback' }
 	}
 	const claimClientId = parseClaimClientId(callback.callbackData)
