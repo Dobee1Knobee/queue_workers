@@ -214,7 +214,9 @@ setInterval(() => {
 const REPEAT_DEDUP_MS = 3 * 60 * 1000
 
 const zoomThreadCallIn = async data => {
-	logger.info('📞 Обработка Call сообщения')
+	logger.info('📞 ========== Обработка Call сообщения ==========')
+	logger.info(`📞 isGatewayEnabled: ${isGatewayEnabled()}`)
+	logger.info(`📞 Data keys: ${Object.keys(data || {}).join(', ')}`)
 
 	const { connection, model } = await getCallConnection()
 

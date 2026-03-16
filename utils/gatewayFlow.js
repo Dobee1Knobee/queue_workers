@@ -25,6 +25,16 @@ const EXPECTED_APP_KEY = process.env.TELEGRAM_GATEWAY_EXPECTED_APP_KEY || ''
 const EXPECTED_ROUTE_KEY = process.env.TELEGRAM_GATEWAY_EXPECTED_ROUTE_KEY || ''
 const REDIRECT_DM_ENABLED = String(process.env.TELEGRAM_GATEWAY_REDIRECT_DM || 'false').toLowerCase() === 'true'
 
+// Log gateway config on startup
+logger.info('🔧 Gateway config:')
+logger.info(`   GATEWAY_ENABLED: ${GATEWAY_ENABLED}`)
+logger.info(`   GATEWAY_URL: ${GATEWAY_URL}`)
+logger.info(`   GATEWAY_API_KEY: ${GATEWAY_API_KEY ? GATEWAY_API_KEY.substring(0, 10) + '...' : 'NOT SET'}`)
+logger.info(`   GATEWAY_API_SECRET: ${GATEWAY_API_SECRET ? GATEWAY_API_SECRET.substring(0, 10) + '...' : 'NOT SET'}`)
+logger.info(`   GATEWAY_CHAT_ID: ${GATEWAY_CHAT_ID}`)
+logger.info(`   GATEWAY_CHAT_ALIAS: ${GATEWAY_CHAT_ALIAS}`)
+logger.info(`   REDIRECT_DM_ENABLED: ${REDIRECT_DM_ENABLED}`)
+
 const isGatewayEnabled = () => GATEWAY_ENABLED
 
 const normalizeClientId = clientId => {
