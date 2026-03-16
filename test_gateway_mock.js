@@ -15,7 +15,7 @@ const mockEvent = {
         username: 'test_manager',
         messageId: 111,
         chatId: -5123319543,
-        data: 'claim:777' // Mocking a claim for client ID 777
+        data: 'claim:zoom:rpt:777' // Mocking a claim for client ID 777 (via claim:zoom format)
     }
 };
 

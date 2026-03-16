@@ -23,6 +23,7 @@ const GATEWAY_CHAT_ID = process.env.TELEGRAM_GATEWAY_CHAT_ID || process.env.TELE
 const GATEWAY_CHAT_ALIAS = process.env.TELEGRAM_GATEWAY_CHAT_ALIAS || ''
 const EXPECTED_APP_KEY = process.env.TELEGRAM_GATEWAY_EXPECTED_APP_KEY || ''
 const EXPECTED_ROUTE_KEY = process.env.TELEGRAM_GATEWAY_EXPECTED_ROUTE_KEY || ''
+const REDIRECT_DM_ENABLED = String(process.env.TELEGRAM_GATEWAY_REDIRECT_DM || 'false').toLowerCase() === 'true'
 
 const isGatewayEnabled = () => GATEWAY_ENABLED
 
@@ -322,10 +323,18 @@ const sendDirectLeadNotificationToGateway = async leadData => {
 		delegatedFromAt: leadData.delegated_from_at,
 	})
 
-	// Use per-manager chat ID if available, otherwise fallback to global gateway chat (unlikely for DMs)
-	const targetChatId = managerChatId || (await getManagerChatIdByAt(managerAt))
+	// Use per-manager chat ID if available, otherwise fallback to global gateway chat
+	let targetChatId = managerChatId || (await getManagerChatIdByAt(managerAt))
+	let redirectionTag = ''
+
+	if (REDIRECT_DM_ENABLED) {
+		const groupTarget = getGatewayChatTarget()
+		targetChatId = groupTarget.chatId || groupTarget.chatAlias
+		redirectionTag = `🕒 [REDIRECTED DM for @${managerAt}]\n`
+	}
+
 	if (!targetChatId) {
-		logger.warn(`⚠️ Manager @${managerAt} has no chatID, cannot send direct lead via gateway`)
+		logger.warn(`⚠️ Manager @${managerAt} has no chatID and no group fallback, cannot send direct lead`)
 		return null
 	}
 
@@ -334,7 +343,7 @@ const sendDirectLeadNotificationToGateway = async leadData => {
 		idempotencyKey: makeIdempotencyKey(`direct-lead-${clientNumericId}-${Date.now()}`),
 		payload: {
 			chatId: String(targetChatId),
-			text,
+			text: redirectionTag + text,
 		},
 	})
 }
