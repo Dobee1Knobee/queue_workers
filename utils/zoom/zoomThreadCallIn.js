@@ -452,11 +452,7 @@ const zoomThreadCallIn = async data => {
 						recentRepeatClients.set(dedupKey, Date.now())
 						
 						if (isGatewayEnabled()) {
-							try {
-								await sendDirectLeadNotificationToGateway(inboundLeadData)
-							} catch (gwErr) {
-								await sendToQueue('new_inbound_lead', inboundLeadData)
-							}
+							await sendDirectLeadNotificationToGateway(inboundLeadData)
 						} else {
 							await sendToQueue('new_inbound_lead', inboundLeadData)
 						}
@@ -497,11 +493,7 @@ const zoomThreadCallIn = async data => {
 						}
 
 						if (isGatewayEnabled()) {
-							try {
-								await sendMissedCallNotification(missedCallData)
-							} catch (gatewayError) {
-								await sendToQueue('repeat_call_in', missedCallData)
-							}
+							await sendMissedCallNotification(missedCallData)
 						} else {
 							await sendToQueue('repeat_call_in', missedCallData)
 						}
@@ -542,11 +534,7 @@ const zoomThreadCallIn = async data => {
 						recentRepeatClients.set(dedupKey, Date.now())
 
 						if (isGatewayEnabled()) {
-							try {
-								await sendDirectLeadNotificationToGateway(inboundLeadData)
-							} catch (gwErr) {
-								await sendToQueue('new_inbound_lead', inboundLeadData)
-							}
+							await sendDirectLeadNotificationToGateway(inboundLeadData)
 						} else {
 							await sendToQueue('new_inbound_lead', inboundLeadData)
 						}
@@ -586,11 +574,7 @@ const zoomThreadCallIn = async data => {
 						}
 
 						if (isGatewayEnabled()) {
-							try {
-								await sendRepeatCallNotification(repeatCallData)
-							} catch (gatewayError) {
-								await sendToQueue('repeat_call_in', repeatCallData)
-							}
+							await sendRepeatCallNotification(repeatCallData)
 						} else {
 							await sendToQueue('repeat_call_in', repeatCallData)
 						}

@@ -23,6 +23,15 @@ services:
       TELEGRAM_GATEWAY_CHAT_ALIAS: ${TELEGRAM_GATEWAY_CHAT_ALIAS:-}
       TELEGRAM_GATEWAY_EXPECTED_APP_KEY: ${TELEGRAM_GATEWAY_EXPECTED_APP_KEY:-}
       TELEGRAM_GATEWAY_EXPECTED_ROUTE_KEY: ${TELEGRAM_GATEWAY_EXPECTED_ROUTE_KEY:-}
+      TELEGRAM_GATEWAY_API_SECRET: ${TELEGRAM_GATEWAY_API_SECRET:-}
+      TELEGRAM_GATEWAY_REDIRECT_DM: ${TELEGRAM_GATEWAY_REDIRECT_DM:-false}
+      AUTO_CLAIM_SHADOW: ${AUTO_CLAIM_SHADOW:-true}
+      AUTO_CLAIM_ENABLED: ${AUTO_CLAIM_ENABLED:-false}
+      AUTO_CLAIM_SEND_DM: ${AUTO_CLAIM_SEND_DM:-false}
+      AUTO_CLAIM_ADMIN: ${AUTO_CLAIM_ADMIN:-}
+      AUTO_CLAIM_LOOKBACK_HOURS: ${AUTO_CLAIM_LOOKBACK_HOURS:-168}
+      AUTO_CLAIM_MIN_CALL_DURATION_SEC: ${AUTO_CLAIM_MIN_CALL_DURATION_SEC:-15}
+      AUTO_CLAIM_CONNECTED_RESULTS: ${AUTO_CLAIM_CONNECTED_RESULTS:-accepted,answered,connected,completed}
       WEBHOOK_SMS_URL: ${WEBHOOK_SMS_URL:-}
       WEBHOOK_CALL_URL: ${WEBHOOK_CALL_URL:-}
     ports:
@@ -49,31 +58,6 @@ services:
       rollback_config:
         parallelism: 1
         order: stop-first
-    networks:
-      - backend
-
-  mini-bot:
-    image: ${IMAGE_MINIBOT}
-    environment:
-      PYTHONUNBUFFERED: 1
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
-      TELEGRAM_PROXY: ${TELEGRAM_PROXY:-}
-      NGROK_TCP_HOST: ${NGROK_TCP_HOST}
-      NGROK_TCP_PORT: ${NGROK_TCP_PORT}
-      RABBITMQ_USER: ${RABBITMQ_USER}
-      RABBITMQ_PASS: ${RABBITMQ_PASS}
-      MONGO_URI: ${MONGO_URI:-${CLIENTS_DB_URL}}
-      AUTO_CLAIM_ADMIN: ${AUTO_CLAIM_ADMIN:-}
-    deploy:
-      replicas: 1
-      placement:
-        constraints:
-          - ${MINI_BOT_PROD_PLACEMENT_CONSTRAINT:-node.hostname == tvmm-prod}
-      restart_policy:
-        condition: any
-        delay: 10s
-        max_attempts: 3
     networks:
       - backend
 

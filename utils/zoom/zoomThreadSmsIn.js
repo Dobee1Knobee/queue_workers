@@ -378,11 +378,7 @@ const zoomThreadSmsIn = async data => {
 					recentRepeatClients.set(dedupKey, Date.now())
 					
 					if (isGatewayEnabled()) {
-						try {
-							await sendDirectLeadNotificationToGateway(inboundLeadData)
-						} catch (gwErr) {
-							await sendToQueue('new_inbound_lead', inboundLeadData)
-						}
+						await sendDirectLeadNotificationToGateway(inboundLeadData)
 					} else {
 						await sendToQueue('new_inbound_lead', inboundLeadData)
 					}
@@ -421,11 +417,7 @@ const zoomThreadSmsIn = async data => {
 					recentRepeatClients.set(dedupKey, Date.now())
 
 					if (isGatewayEnabled()) {
-						try {
-							await sendDirectLeadNotificationToGateway(inboundLeadData)
-						} catch (gwErr) {
-							await sendToQueue('new_inbound_lead', inboundLeadData)
-						}
+						await sendDirectLeadNotificationToGateway(inboundLeadData)
 					} else {
 						await sendToQueue('new_inbound_lead', inboundLeadData)
 					}
@@ -462,11 +454,7 @@ const zoomThreadSmsIn = async data => {
 					}
 
 					if (isGatewayEnabled()) {
-						try {
-							await sendRepeatSmsNotification(smsLeadData)
-						} catch (gatewayError) {
-							await sendToQueue('repeat_sms_in', smsLeadData)
-						}
+						await sendRepeatSmsNotification(smsLeadData)
 					} else {
 						await sendToQueue('repeat_sms_in', smsLeadData)
 					}

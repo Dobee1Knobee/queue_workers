@@ -2,6 +2,7 @@ require('dotenv').config()
 const mongoose = require('mongoose')
 const logger = require('pino')()
 const { sendToQueue } = require('./rabbitmq')
+const { isGatewayEnabled, gatewayPostInternal, makeIdempotencyKey, getGatewayChatTarget } = require('./gatewayFlow')
 const SHIFT_REPLACEMENTS = require('../config/shiftReplacements')
 
 let tvmountConnection = null
@@ -464,25 +465,39 @@ const tryAutoClaimOpenLeadFromCall = async ({
 	})
 
 	if (decision.eligible && (AUTO_CLAIM_ENABLED || AUTO_CLAIM_SHADOW)) {
-		await enqueueAutoClaimRequest({
-			lead,
-			manager,
-			channel: 'call',
-			trigger: 'call_outgoing',
-			triggerKey: callId || `${lead._id}:${manager.manager_at}:call`,
-			matchMethod,
-			eventPhone: normalizedPhone || normalizePhone(phone),
-			reason: decision.reason,
-			extra: {
-				apply_mode: AUTO_CLAIM_ENABLED ? 'enabled' : 'shadow_apply',
-				suppress_dm: !AUTO_CLAIM_SEND_DM,
-				delegated_from_at: manager?.delegated_from_at || null,
-				replacement_candidate_at: manager?.replacement_candidate_at || null,
-				call_id: callId || null,
-				result: result || null,
-				duration_sec: decision.durationSec ?? null,
-			},
-		})
+		if (isGatewayEnabled()) {
+			await applyClaimDirectly({
+				lead,
+				manager,
+				suppressDm: !AUTO_CLAIM_SEND_DM,
+				extra: {
+					apply_mode: AUTO_CLAIM_ENABLED ? 'enabled' : 'shadow_apply',
+					call_id: callId || null,
+					result: result || null,
+					duration_sec: decision.durationSec ?? null,
+				},
+			})
+		} else {
+			await enqueueAutoClaimRequest({
+				lead,
+				manager,
+				channel: 'call',
+				trigger: 'call_outgoing',
+				triggerKey: callId || `${lead._id}:${manager.manager_at}:call`,
+				matchMethod,
+				eventPhone: normalizedPhone || normalizePhone(phone),
+				reason: decision.reason,
+				extra: {
+					apply_mode: AUTO_CLAIM_ENABLED ? 'enabled' : 'shadow_apply',
+					suppress_dm: !AUTO_CLAIM_SEND_DM,
+					delegated_from_at: manager?.delegated_from_at || null,
+					replacement_candidate_at: manager?.replacement_candidate_at || null,
+					call_id: callId || null,
+					result: result || null,
+					duration_sec: decision.durationSec ?? null,
+				},
+			})
+		}
 	}
 
 	return {
@@ -565,24 +580,37 @@ const tryAutoClaimOpenLeadFromSms = async ({
 	})
 
 	if (decision.eligible && (AUTO_CLAIM_ENABLED || AUTO_CLAIM_SHADOW)) {
-		await enqueueAutoClaimRequest({
-			lead,
-			manager,
-			channel: 'sms',
-			trigger: 'sms_outgoing',
-			triggerKey: messageId || `${lead._id}:${manager.manager_at}:sms`,
-			matchMethod,
-			eventPhone: normalizedPhone || normalizePhone(phone),
-			reason: decision.reason,
-			extra: {
-				apply_mode: AUTO_CLAIM_ENABLED ? 'enabled' : 'shadow_apply',
-				suppress_dm: !AUTO_CLAIM_SEND_DM,
-				delegated_from_at: manager?.delegated_from_at || null,
-				replacement_candidate_at: manager?.replacement_candidate_at || null,
-				message_id: messageId || null,
-				owner_id: ownerId || null,
-			},
-		})
+		if (isGatewayEnabled()) {
+			await applyClaimDirectly({
+				lead,
+				manager,
+				suppressDm: !AUTO_CLAIM_SEND_DM,
+				extra: {
+					apply_mode: AUTO_CLAIM_ENABLED ? 'enabled' : 'shadow_apply',
+					message_id: messageId || null,
+					owner_id: ownerId || null,
+				},
+			})
+		} else {
+			await enqueueAutoClaimRequest({
+				lead,
+				manager,
+				channel: 'sms',
+				trigger: 'sms_outgoing',
+				triggerKey: messageId || `${lead._id}:${manager.manager_at}:sms`,
+				matchMethod,
+				eventPhone: normalizedPhone || normalizePhone(phone),
+				reason: decision.reason,
+				extra: {
+					apply_mode: AUTO_CLAIM_ENABLED ? 'enabled' : 'shadow_apply',
+					suppress_dm: !AUTO_CLAIM_SEND_DM,
+					delegated_from_at: manager?.delegated_from_at || null,
+					replacement_candidate_at: manager?.replacement_candidate_at || null,
+					message_id: messageId || null,
+					owner_id: ownerId || null,
+				},
+			})
+		}
 	}
 
 	return {
@@ -591,6 +619,114 @@ const tryAutoClaimOpenLeadFromSms = async ({
 		wouldAutoClaim: decision.eligible,
 		reason: decision.reason,
 	}
+}
+
+const applyClaimDirectly = async ({ lead, manager, suppressDm = false, extra = {} }) => {
+	if (!lead || !manager?.manager_at) {
+		logger.warn('⚠️ applyClaimDirectly: missing lead or manager')
+		return false
+	}
+
+	if (lead.manager_at) {
+		logger.info(`⚠️ Lead ${lead._id} already claimed by @${lead.manager_at}`)
+		return false
+	}
+
+	const FilledFormsModel = await getCollectionModel('filled_forms')
+
+	await FilledFormsModel.updateOne(
+		{ _id: lead._id },
+		{
+			$set: {
+				team: manager.team || null,
+				manager_id: manager.manager_id || null,
+				manager_at: manager.manager_at,
+				claim_source: extra.apply_mode || 'auto',
+				claim_resolution_method: manager.resolution_method || null,
+				delegated_from_at: manager.delegated_from_at || null,
+				delegated_from_manager_id: manager.delegated_from_manager_id || null,
+			},
+		}
+	)
+
+	logger.info(`✅ MongoDB updated for lead ${lead._id}`)
+
+	if (isGatewayEnabled() && lead.chat_message_id && lead.test_chat_id) {
+		const updatedText = `claimed by @${manager.manager_at} #${manager.manager_id || 'T0'}${manager.team || 'TEST'}\n${lead.text || ''}`
+		
+		try {
+			await gatewayPostInternal({
+				operationType: 'edit_message_text',
+				idempotencyKey: makeIdempotencyKey(`auto-claim-edit-${lead._id}`),
+				payload: {
+					chatId: String(lead.test_chat_id),
+					messageId: Number(lead.chat_message_id),
+					text: updatedText,
+				},
+			})
+			logger.info(`✅ Message edited via gateway for lead ${lead._id}`)
+		} catch (err) {
+			logger.warn(`⚠️ Failed to edit message via gateway: ${err.message}`)
+		}
+	}
+
+	if (!suppressDm && manager.chat_id) {
+		if (isGatewayEnabled()) {
+			const REDIRECT_DM_ENABLED = String(process.env.TELEGRAM_GATEWAY_REDIRECT_DM || 'false').toLowerCase() === 'true'
+			let targetChatId = manager.chat_id
+			let redirectionTag = ''
+
+			if (REDIRECT_DM_ENABLED) {
+				const groupTarget = getGatewayChatTarget()
+				targetChatId = groupTarget.chatId || groupTarget.chatAlias
+				redirectionTag = `🕒 [REDIRECTED DM for @${manager.manager_at}]\n`
+			}
+
+			const smsText = lead.sms_text ? `\n\n💬 Текст СМС:\n${lead.sms_text.replace(/\\n/g, '\n')}` : ''
+			const dmText = `Client #c${lead.client_id ?? '_'}\nCampaign: ${lead.cpmn_name ?? '_'}\nPhone: ${lead.telephone || '_'}${smsText}`
+
+			try {
+				await gatewayPostInternal({
+					operationType: 'send_message',
+					idempotencyKey: makeIdempotencyKey(`auto-claim-dm-${lead._id}`),
+					payload: {
+						chatId: String(targetChatId),
+						text: redirectionTag + dmText,
+					},
+				})
+				logger.info(`✅ DM sent via gateway for lead ${lead._id} to ${REDIRECT_DM_ENABLED ? 'group' : `@${manager.manager_at}`}`)
+			} catch (err) {
+				logger.warn(`⚠️ Failed to send DM via gateway: ${err.message}`)
+			}
+		}
+	}
+
+	const clientId = lead.client_id
+	if (clientId !== null && clientId !== undefined) {
+		const utcNow = new Date()
+		const shiftStart = new Date(utcNow)
+		if (utcNow.getUTCHours() >= 4) {
+			shiftStart.setUTCHours(0, 0, 0, 0)
+		} else {
+			shiftStart.setUTCDate(shiftStart.getUTCDate() - 1)
+			shiftStart.setUTCHours(0, 0, 0, 0)
+		}
+
+		await sendToQueue('personal_claimed_leads', {
+			shift_date: shiftStart.toISOString().slice(0, 10),
+			client_id: clientId,
+			manager_at: manager.manager_at,
+			team: manager.team || null,
+			form_id: String(lead._id),
+			form_date: lead.date,
+			claim_date: utcNow.toISOString(),
+			event: 'claim',
+			claim_source: 'auto',
+		})
+	}
+
+	logger.info(`✅ [auto-claim] @${manager.manager_at} claimed #c${lead.client_id} (form ${lead._id})`)
+	return true
 }
 
 module.exports = {

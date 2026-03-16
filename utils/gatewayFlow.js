@@ -381,11 +381,9 @@ const formatClaimDm = ({ form, clientRef, managerAt }) => {
 	const smsRaw = form?.sms_text || ''
 	const smsText = smsRaw ? `\n\n💬 Текст СМС:\n${String(smsRaw).replace(/\\n/g, '\n')}` : ''
 
-	const AUTO_CLAIM_ADMIN = process.env.AUTO_CLAIM_ADMIN || ''
-	const redirectNote =
-		AUTO_CLAIM_ADMIN && managerAt
-			? `\n\n🔄 [REDIRECTED from @${managerAt}]`
-			: ''
+	const redirectNote = REDIRECT_DM_ENABLED && managerAt
+		? `\n\n🔄 [REDIRECTED from @${managerAt}]`
+		: ''
 
 	return (
 		`Client #c${form?.client_id ?? '_'}\n` +
@@ -505,7 +503,15 @@ const handleGatewayTelegramEvent = async payload => {
 		})
 	}
 
-	const claimerChatId = user?.chat_id || callback.fromId
+	let claimerChatId = user?.chat_id || callback.fromId
+	let redirectionTag = ''
+
+	if (REDIRECT_DM_ENABLED) {
+		const groupTarget = getGatewayChatTarget()
+		claimerChatId = groupTarget.chatId || groupTarget.chatAlias
+		redirectionTag = `🕒 [REDIRECTED DM for @${managerAt}]\n`
+	}
+
 	if (claimerChatId) {
 		try {
 			await gatewayPostInternal({
@@ -513,7 +519,7 @@ const handleGatewayTelegramEvent = async payload => {
 				idempotencyKey: makeIdempotencyKey(`claim-dm-${form._id}`),
 				payload: {
 					chatId: String(claimerChatId),
-					text: formatClaimDm({ form, clientRef, managerAt }),
+					text: redirectionTag + formatClaimDm({ form, clientRef, managerAt }),
 				},
 			})
 		} catch (error) {
@@ -575,4 +581,7 @@ module.exports = {
 	sendDirectLeadNotificationToGateway,
 	handleGatewayTelegramEvent,
 	verifyGatewayEventHeaders,
+	gatewayPostInternal,
+	makeIdempotencyKey,
+	getGatewayChatTarget,
 }

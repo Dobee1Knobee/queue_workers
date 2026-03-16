@@ -10,7 +10,6 @@ stages:
 
 variables:
   REGISTRY_IMAGE_WORKERS: '$CI_REGISTRY_IMAGE/workers'
-  REGISTRY_IMAGE_MINIBOT: '$CI_REGISTRY_IMAGE/minibot'
   DOCKER_DRIVER: overlay2
 
 build-image:
@@ -20,7 +19,6 @@ build-image:
   script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker build --pull -t "$REGISTRY_IMAGE_WORKERS:$CI_COMMIT_TAG" .
-    - docker build --pull -t "$REGISTRY_IMAGE_MINIBOT:$CI_COMMIT_TAG" -f Dockerfile.minibot .
 
 publish-image:
   stage: publish
@@ -30,7 +28,6 @@ publish-image:
   script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker push "$REGISTRY_IMAGE_WORKERS:$CI_COMMIT_TAG"
-    - docker push "$REGISTRY_IMAGE_MINIBOT:$CI_COMMIT_TAG"
 
 deploy-dev:
   stage: deploy
@@ -42,9 +39,7 @@ deploy-dev:
   script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker pull "$REGISTRY_IMAGE_WORKERS:$CI_COMMIT_TAG"
-    - docker pull "$REGISTRY_IMAGE_MINIBOT:$CI_COMMIT_TAG"
     - export IMAGE=$REGISTRY_IMAGE_WORKERS:$CI_COMMIT_TAG
-    - export IMAGE_MINIBOT=$REGISTRY_IMAGE_MINIBOT:$CI_COMMIT_TAG
     - docker stack deploy -c docker-stack.dev.yml --with-registry-auth queue-workers-dev
 
 deploy-prod:
@@ -57,7 +52,5 @@ deploy-prod:
   script:
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker pull "$REGISTRY_IMAGE_WORKERS:$CI_COMMIT_TAG"
-    - docker pull "$REGISTRY_IMAGE_MINIBOT:$CI_COMMIT_TAG"
     - export IMAGE=$REGISTRY_IMAGE_WORKERS:$CI_COMMIT_TAG
-    - export IMAGE_MINIBOT=$REGISTRY_IMAGE_MINIBOT:$CI_COMMIT_TAG
     - docker stack deploy -c docker-stack.prod.yml --with-registry-auth queue-workers-prod
