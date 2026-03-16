@@ -8,6 +8,7 @@ const {
 	isGatewayEnabled,
 	sendRepeatCallNotification,
 	sendMissedCallNotification,
+	sendDirectLeadNotificationToGateway,
 } = require('../gatewayFlow')
 const { tryAutoClaimOpenLeadFromCall, resolveEffectiveManager, findUserByAt } = require('../autoClaim')
 const SHIFT_REPLACEMENTS = require('../../config/shiftReplacements')
@@ -30,7 +31,7 @@ const findClaimedManagerForClient = async (clientId, tvmountConn) => {
 	
 	const form = await FilledFormsModel.findOne({
 		client_id: clientId,
-		manager_at: { $exists: true, $ne: null, $ne: '' },
+		manager_at: { $exists: true, $nin: [null, ''] },
 		date: { $gte: cutoff.toISOString() },
 	}).sort({ date: -1 })
 	
@@ -200,6 +201,16 @@ const normalizeCallResult = result => String(result || '').trim().toLowerCase()
 
 // Dedup: skip duplicate lead notifications for the same client in a short window
 const recentRepeatClients = new Map()
+
+// Memory leak protection: periodically clear old entries
+setInterval(() => {
+	const now = Date.now()
+	for (const [clientId, timestamp] of recentRepeatClients.entries()) {
+		if (now - timestamp > 10 * 60 * 1000) { // Keep for 10 minutes max
+			recentRepeatClients.delete(clientId)
+		}
+	}
+}, 5 * 60 * 1000) // Run every 5 minutes
 const REPEAT_DEDUP_MS = 3 * 60 * 1000
 
 const zoomThreadCallIn = async data => {
@@ -439,7 +450,17 @@ const zoomThreadCallIn = async data => {
 						logger.info(`⏭️ Дедупликация: уже отправлен`)
 					} else {
 						recentRepeatClients.set(dedupKey, Date.now())
-						await sendToQueue('new_inbound_lead', inboundLeadData)
+						
+						if (isGatewayEnabled()) {
+							try {
+								await sendDirectLeadNotificationToGateway(inboundLeadData)
+							} catch (gwErr) {
+								await sendToQueue('new_inbound_lead', inboundLeadData)
+							}
+						} else {
+							await sendToQueue('new_inbound_lead', inboundLeadData)
+						}
+
 						logger.info(
 							`✅ missed_call DM отправлен @${claimedManager.at} (client=${clientNumericId})`
 						)
@@ -519,7 +540,17 @@ const zoomThreadCallIn = async data => {
 						)
 					} else {
 						recentRepeatClients.set(dedupKey, Date.now())
-						await sendToQueue('new_inbound_lead', inboundLeadData)
+
+						if (isGatewayEnabled()) {
+							try {
+								await sendDirectLeadNotificationToGateway(inboundLeadData)
+							} catch (gwErr) {
+								await sendToQueue('new_inbound_lead', inboundLeadData)
+							}
+						} else {
+							await sendToQueue('new_inbound_lead', inboundLeadData)
+						}
+
 						logger.info(
 							`✅ new_inbound_lead отправлен для answered call client=${clientNumericId}, manager=${responsibleManager.at}`
 						)

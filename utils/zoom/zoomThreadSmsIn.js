@@ -7,6 +7,7 @@ const { sendToQueue } = require('../rabbitmq')
 const {
 	isGatewayEnabled,
 	sendRepeatSmsNotification,
+	sendDirectLeadNotificationToGateway,
 } = require('../gatewayFlow')
 const { tryAutoClaimOpenLeadFromSms } = require('../autoClaim')
 const SHIFT_REPLACEMENTS = require('../../config/shiftReplacements')
@@ -29,7 +30,7 @@ const findClaimedManagerForClient = async (clientId, tvmountConn) => {
 	
 	const form = await FilledFormsModel.findOne({
 		client_id: clientId,
-		manager_at: { $exists: true, $ne: null, $ne: '' },
+		manager_at: { $exists: true, $nin: [null, ''] },
 		date: { $gte: cutoff.toISOString() },
 	}).sort({ date: -1 })
 	
@@ -197,6 +198,16 @@ const getClientPhoneFromSms = (event, smsData) => {
 
 // Dedup: skip repeat notifications for the same client within 10 minutes
 const recentRepeatClients = new Map()
+
+// Memory leak protection: periodically clear old entries
+setInterval(() => {
+	const now = Date.now()
+	for (const [clientId, timestamp] of recentRepeatClients.entries()) {
+		if (now - timestamp > 10 * 60 * 1000) { // Keep for 10 minutes max
+			recentRepeatClients.delete(clientId)
+		}
+	}
+}, 5 * 60 * 1000) // Run every 5 minutes
 const REPEAT_DEDUP_MS = 3 * 60 * 1000
 
 const zoomThreadSmsIn = async data => {
@@ -365,7 +376,17 @@ const zoomThreadSmsIn = async data => {
 					logger.info(`⏭️ Дедупликация: уже отправлен`)
 				} else {
 					recentRepeatClients.set(dedupKey, Date.now())
-					await sendToQueue('new_inbound_lead', inboundLeadData)
+					
+					if (isGatewayEnabled()) {
+						try {
+							await sendDirectLeadNotificationToGateway(inboundLeadData)
+						} catch (gwErr) {
+							await sendToQueue('new_inbound_lead', inboundLeadData)
+						}
+					} else {
+						await sendToQueue('new_inbound_lead', inboundLeadData)
+					}
+					
 					logger.info(
 						`✅ SMS DM отправлен @${claimedManager.at} (client=${clientNumericId})`
 					)
@@ -398,7 +419,17 @@ const zoomThreadSmsIn = async data => {
 					logger.info(`⏭️ Дедупликация: уже отправлен`)
 				} else {
 					recentRepeatClients.set(dedupKey, Date.now())
-					await sendToQueue('new_inbound_lead', inboundLeadData)
+
+					if (isGatewayEnabled()) {
+						try {
+							await sendDirectLeadNotificationToGateway(inboundLeadData)
+						} catch (gwErr) {
+							await sendToQueue('new_inbound_lead', inboundLeadData)
+						}
+					} else {
+						await sendToQueue('new_inbound_lead', inboundLeadData)
+					}
+
 					logger.info(
 						`✅ SMS DM отправлен @${responsibleManager.at} (client=${clientNumericId})`
 					)

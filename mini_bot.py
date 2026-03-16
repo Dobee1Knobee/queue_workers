@@ -5,6 +5,7 @@ import re
 import time
 import aio_pika
 from datetime import datetime, timezone, timedelta
+import math
 from bson import ObjectId
 from pymongo import MongoClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,6 +31,17 @@ RABBIT_PORT = int(os.environ.get("NGROK_TCP_PORT", "21850"))
 RABBIT_USER = os.environ.get("RABBITMQ_USER", "guest")
 RABBIT_PASS = os.environ.get("RABBITMQ_PASS", "guest")
 AUTO_CLAIM_QUEUE = os.environ.get("AUTO_CLAIM_QUEUE", "auto_claim_in")
+
+SHIFT_REPLACEMENTS = {
+    'maestro_dave': 'intheiceage',
+    'jaherrjarus': 'stealthespirit',
+    'alexeyblau': 'millerbeer',
+    'murmurhamdy': 'SSales2025',
+    'vainshtein': 'WaveyG_21',
+    'vlrsvlv': 'tralalerodon',
+    'Taddy_BamBam': 'kirillos8888',
+    'arsen2243': 'shawtypaid',
+}
 
 # MongoDB
 MONGO_URI = os.environ.get("MONGO_URI", os.environ.get("CLIENTS_DB_URL", ""))
@@ -91,7 +103,7 @@ def find_claimed_manager_for_client(client_id, window_days=REPEAT_CONTACT_WINDOW
     form = filled_forms_db.find_one(
         {
             "client_id": client_id,
-            "manager_at": {"$exists": True, "$ne": None, "$ne": ""},
+            "manager_at": {"$exists": True, "$nin": [None, ""]},
             "date": {"$gte": cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")},
         },
         sort=[("date", -1)]
@@ -104,7 +116,28 @@ def find_claimed_manager_for_client(client_id, window_days=REPEAT_CONTACT_WINDOW
     if not manager_at:
         return None
     
-    return users_db.find_one({"at": manager_at})
+    manager = users_db.find_one({"at": manager_at})
+    if not manager:
+        return None
+
+    # Shift Replacement Logic
+    if manager.get("working") is not True:
+        replacement_at = SHIFT_REPLACEMENTS.get(manager_at)
+        if replacement_at:
+            replacement = users_db.find_one({"at": replacement_at})
+            if replacement:
+                # Add metadata to indicate delegation
+                replacement["delegated_from_at"] = manager_at
+                replacement["delegated_from_manager_id"] = manager.get("_id")
+                return replacement
+                
+    return manager
+
+
+def get_two_weeks_ago_id():
+    """Generates an ObjectId corresponding to 14 days ago for comparison with _id."""
+    timestamp = int(time.time() - (14 * 24 * 60 * 60))
+    return ObjectId(f"{hex(timestamp)[2:]:0>8}0000000000000000")
 
 
 async def get_manager_chat_id(manager_at):
@@ -378,7 +411,6 @@ async def zoom_repeat_call_in(data):
         
         # Format date if available
         date_line = f"\n📅 {date_time}" if date_time else ""
-        team_line = f"\n👥 Команда: {team}" if team else ""
         
         # For missed calls, check if client was claimed within last 2 weeks
         # If yes, route directly to that manager's DM
@@ -406,10 +438,11 @@ async def zoom_repeat_call_in(data):
                     redirect_note = ""
                 
                 if manager_chat_id:
+                    # DM for missed call - INCLUDE PHONE
                     await throttled_send_message(
                         chat_id=manager_chat_id,
                         text=(
-                            f"☎️ Пропущенный звонок от клиента\n"
+                            f"☎️ Пропущенный звонок\n"
                             f"Клиент: #c{client_numeric_id}\n"
                             f"Phone: {customer_number}\n"
                             f"Статус: {call_result or 'unknown'}"
@@ -432,13 +465,34 @@ async def zoom_repeat_call_in(data):
 
         order_block = f"\n\n📋 Прошлые заказы:{order_ids_text}" if order_ids_text else ""
         status_line = f"\nСтатус: {call_result}" if is_missed_call and call_result else ""
+        
+        # Determine labels
+        has_orders = len(recent_orders) > 0
+        two_weeks_ago_id = get_two_weeks_ago_id()
+        has_recent_order = any(o.get("_id") >= two_weeks_ago_id for o in recent_orders)
+        
+        # Determine client status label (consistent with gateway)
+        if has_recent_order:
+            client_status = "🟢 АКТИВНЫЙ КЛИЕНТ"
+        elif has_orders:
+            client_status = "🟡 ПОВТОРНЫЙ КЛИЕНТ"
+        else:
+            client_status = "🔵 НОВЫЙ КЛИЕНТ"
 
+        if is_missed_call:
+            lead_label = "☎️ Пропущенный звонок"
+        elif has_orders:
+            lead_label = "📞 Повторный звонок"
+        else:
+            lead_label = "📞 Входящий звонок"
+
+        # Group message - NO PHONE NUMBER
         text = (
-            f"{'☎️ Пропущенный звонок' if is_missed_call else '📞 Повторный звонок'}\n"
+            f"{lead_label}\n"
+            f"{client_status}\n"
             f"Клиент: #c{client_numeric_id}"
             f"{status_line}"
             f"{date_line}"
-            f"{team_line}"
             f"{order_block}"
         )
 
@@ -505,13 +559,15 @@ async def zoom_repeat_sms_in(data):
                 redirect_note = ""
             
             if manager_chat_id:
+                formatted_text = message_text.replace("\\n", "\n") if message_text else ""
+                # DM for SMS - INCLUDE PHONE
                 await throttled_send_message(
                     chat_id=manager_chat_id,
                     text=(
-                        f"💬 Повторное СМС от клиента\n"
+                        f"💬 Входящее SMS\n"
                         f"Клиент: #c{client_numeric_id}\n"
-                        f"Phone: {customer_number}\n"
-                        f"Текст: {message_text}"
+                        f"Phone: {customer_number}\n\n"
+                        f"💬 Текст:\n{formatted_text}"
                         f"{order_block}"
                         f"{redirect_note}"
                     ),
@@ -531,9 +587,24 @@ async def zoom_repeat_sms_in(data):
 
         order_block = f"\n\n📋 Прошлые заказы:{order_ids_text}" if order_ids_text else ""
 
-        # Group message: NO sms text or phone shown (confidential — only in DM after Claim)
+        # Determine labels
+        has_orders = len(recent_orders) > 0
+        two_weeks_ago_id = get_two_weeks_ago_id()
+        has_recent_order = any(o.get("_id") >= two_weeks_ago_id for o in recent_orders)
+        
+        # Determine client status label (consistent with gateway)
+        if has_recent_order:
+            client_status = "🟢 АКТИВНЫЙ КЛИЕНТ"
+        elif has_orders:
+            client_status = "🟡 ПОВТОРНЫЙ КЛИЕНТ"
+        else:
+            client_status = "🔵 НОВЫЙ КЛИЕНТ"
+            
+        lead_label = "💬 Входящее SMS" if not has_orders else "💬 Повторное СМС"
+        
         text = (
-            f"💬 Повторное СМС\n"
+            f"{lead_label}\n"
+            f"{client_status}\n"
             f"Клиент: #c{client_numeric_id}"
             f"{order_block}"
         )
@@ -677,20 +748,20 @@ async def zoom_new_inbound_lead(data):
         
         # Build message based on type
         if lead_type == "inbound_sms":
-            content_text = f"Текст: {message_text}" if message_text else ""
+            formatted_text = message_text.replace("\\n", "\n") if message_text else ""
+            content_text = f"\n\n💬 Текст:\n{formatted_text}" if formatted_text else ""
             lead_label = "💬 Входящее SMS"
         elif lead_type == "active_call":
-            content_text = f"Статус: {call_result}" if call_result else ""
+            content_text = f"\n\nСтатус: {call_result}" if call_result else ""
             lead_label = "☎️ Звонок от активного клиента"
         elif lead_type == "missed_call":
-            content_text = f"Статус: {call_result or 'missed'}"
+            content_text = f"\n\nСтатус: {call_result or 'missed'}"
             lead_label = "☎️ Пропущенный звонок"
         else:
-            content_text = f"Статус: {call_result}" if call_result else ""
+            content_text = f"\n\nСтатус: {call_result}" if call_result else ""
             lead_label = "☎️ Входящий звонок"
         
-        ext_info = f"\n📱 На экстеншн: {ext}" if ext else ""
-        
+        # DM message - INCLUDE PHONE
         await throttled_send_message(
             chat_id=manager_chat_id,
             text=(
@@ -698,7 +769,6 @@ async def zoom_new_inbound_lead(data):
                 f"{client_status}\n"
                 f"Клиент: #c{client_numeric_id}\n"
                 f"Phone: {customer_number}"
-                f"{ext_info}\n"
                 f"{content_text}"
                 f"{delegation_note}"
                 f"{redirect_note}"

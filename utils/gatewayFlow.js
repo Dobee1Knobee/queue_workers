@@ -55,11 +55,18 @@ const buildValueVariants = value => {
 }
 
 const parseClaimClientId = callbackData => {
-	if (typeof callbackData !== 'string' || !callbackData.startsWith('claim:')) return null
-	const raw = callbackData.slice('claim:'.length).trim()
-	if (!raw) return null
-	const numeric = Number(raw)
-	return Number.isFinite(numeric) ? numeric : raw
+	if (typeof callbackData !== 'string') return null
+	if (callbackData.startsWith('claim:z:')) {
+		const parts = callbackData.split(':')
+		return parts[parts.length - 1] // The last part is the client ID
+	}
+	if (callbackData.startsWith('claim:')) {
+		const raw = callbackData.slice('claim:'.length).trim()
+		if (!raw) return null
+		const numeric = Number(raw)
+		return Number.isFinite(numeric) ? numeric : raw
+	}
+	return null
 }
 
 const getGatewayChatTarget = () => {
@@ -184,7 +191,23 @@ const safeAnswerCallback = async (callbackQueryId, text, showAlert = false) => {
 	}
 }
 
-const buildLeadMessage = ({ type, clientNumericId, recentOrders, callResult }) => {
+const getClientStatusLabel = ({ hasRecentOrder, hasAnyOrder }) => {
+	if (hasRecentOrder) return '🟢 АКТИВНЫЙ КЛИЕНТ'
+	if (hasAnyOrder) return '🟡 ПОВТОРНЫЙ КЛИЕНТ'
+	return '🔵 НОВЫЙ КЛИЕНТ'
+}
+
+const buildLeadMessage = ({
+	type,
+	clientNumericId,
+	customerNumber,
+	recentOrders,
+	callResult,
+	hasRecentOrder,
+	hasAnyOrder,
+	message,
+	delegatedFromAt,
+}) => {
 	let orderIdsText = ''
 	for (const order of recentOrders || []) {
 		const orderId = getOrderId(order)
@@ -192,14 +215,23 @@ const buildLeadMessage = ({ type, clientNumericId, recentOrders, callResult }) =
 	}
 	const orderBlock = orderIdsText ? `\n\n📋 Прошлые заказы:${orderIdsText}` : ''
 
+	const statusLabel = getClientStatusLabel({ hasRecentOrder, hasAnyOrder })
+	const delegationLine = delegatedFromAt ? `\n🕒 Delegated from @${delegatedFromAt}` : ''
+	const phoneLine = customerNumber ? `\nPhone: ${customerNumber}` : ''
+
 	if (type === 'call') {
-		return `📞 Повторный звонок\nКлиент: #c${clientNumericId}${orderBlock}`
+		return `📞 Повторный звонок\nКлиент: #c${clientNumericId}${phoneLine}\nСтатус: ${statusLabel}${delegationLine}${orderBlock}`
 	}
 	if (type === 'missed_call') {
-		const statusLine = callResult ? `\nСтатус: ${callResult}` : ''
-		return `☎️ Пропущенный звонок\nКлиент: #c${clientNumericId}${statusLine}${orderBlock}`
+		const callStatusLine = callResult ? `\nЗвонок: ${callResult}` : ''
+		return `☎️ Пропущенный звонок\nКлиент: #c${clientNumericId}${phoneLine}\nСтатус: ${statusLabel}${callStatusLine}${delegationLine}${orderBlock}`
 	}
-	return `💬 Повторное СМС\nКлиент: #c${clientNumericId}${orderBlock}`
+	if (type === 'sms') {
+		const formattedSms = message ? message.replace(/\\n/g, '\n') : ''
+		const smsContent = formattedSms ? `\n\n💬 Текст СМС:\n${formattedSms}` : ''
+		return `💬 Входящее СМС\nКлиент: #c${clientNumericId}${phoneLine}\nСтатус: ${statusLabel}${delegationLine}${smsContent}${orderBlock}`
+	}
+	return `🆕 Новый лид\nКлиент: #c${clientNumericId}${phoneLine}\nСтатус: ${statusLabel}${delegationLine}${orderBlock}`
 }
 
 const sendLeadNotificationToGateway = async ({ type, leadData }) => {
@@ -208,8 +240,19 @@ const sendLeadNotificationToGateway = async ({ type, leadData }) => {
 	const messageText = leadData.message || ''
 	const recentOrders = leadData.orders || []
 	const callResult = leadData.result || ''
-	const text = buildLeadMessage({ type, clientNumericId, recentOrders, callResult })
+	const text = buildLeadMessage({
+		type,
+		clientNumericId,
+		customerNumber: null, // No phone in group messages
+		recentOrders,
+		callResult,
+		hasRecentOrder: leadData.has_recent_order,
+		hasAnyOrder: leadData.has_any_order,
+		message: messageText,
+		delegatedFromAt: leadData.delegated_from_at,
+	})
 
+	const claimType = type === 'sms' ? 'sms' : type === 'missed_call' ? 'missed' : 'rpt'
 	const sendResp = await gatewayPostInternal({
 		operationType: 'send_message',
 		idempotencyKey: makeIdempotencyKey(`lead-${type}-${clientNumericId}`),
@@ -217,7 +260,9 @@ const sendLeadNotificationToGateway = async ({ type, leadData }) => {
 			...getGatewayChatTarget(),
 			text,
 			replyMarkup: {
-				inlineKeyboard: [[{ text: 'Claim', callbackData: `claim:${clientNumericId}` }]],
+				inlineKeyboard: [
+					[{ text: 'Claim', callbackData: `claim:z:${claimType}:${clientNumericId}` }],
+				],
 			},
 		},
 	})
@@ -261,6 +306,51 @@ const sendRepeatSmsNotification = repeatData =>
 const sendMissedCallNotification = missedData =>
 	sendLeadNotificationToGateway({ type: 'missed_call', leadData: missedData })
 
+const sendDirectLeadNotificationToGateway = async leadData => {
+	const clientNumericId = leadData.client_numeric_id || leadData.client_id
+	const managerAt = leadData.manager_at
+	const managerChatId = leadData.manager_chat_id
+
+	if (!managerAt) {
+		logger.warn(`⚠️ Cannot send direct lead to gateway: manager_at missing client=${clientNumericId}`)
+		return null
+	}
+
+	const text = buildLeadMessage({
+		type: leadData.lead_type === 'missed_call' ? 'missed_call' : 'direct',
+		clientNumericId,
+		customerNumber, // Include phone in direct DMs
+		recentOrders: leadData.orders || [],
+		callResult: leadData.result || '',
+		hasRecentOrder: leadData.has_recent_order,
+		hasAnyOrder: leadData.has_any_order,
+		message: leadData.message || '',
+		delegatedFromAt: leadData.delegated_from_at,
+	})
+
+	// Use per-manager chat ID if available, otherwise fallback to global gateway chat (unlikely for DMs)
+	const targetChatId = managerChatId || (await getManagerChatIdByAt(managerAt))
+	if (!targetChatId) {
+		logger.warn(`⚠️ Manager @${managerAt} has no chatID, cannot send direct lead via gateway`)
+		return null
+	}
+
+	return gatewayPostInternal({
+		operationType: 'send_message',
+		idempotencyKey: makeIdempotencyKey(`direct-lead-${clientNumericId}-${Date.now()}`),
+		payload: {
+			chatId: String(targetChatId),
+			text,
+		},
+	})
+}
+
+const getManagerChatIdByAt = async managerAt => {
+	const UsersModel = await getCollectionModel('users')
+	const user = await UsersModel.findOne({ at: managerAt })
+	return user?.chat_id || null
+}
+
 const extractGatewayCallback = payload => {
 	const callbackQuery = payload?.callbackQuery || payload?.rawUpdate?.callback_query || {}
 	const callbackMessage =
@@ -282,16 +372,23 @@ const extractGatewayCallback = payload => {
 	}
 }
 
-const formatClaimDm = ({ form, clientRef }) => {
+const formatClaimDm = ({ form, clientRef, managerAt }) => {
 	const phone = form?.telephone || '_'
 	const clientName = clientRef?.client_name || '_'
 	const smsRaw = form?.sms_text || ''
 	const smsText = smsRaw ? `\n\n💬 Текст СМС:\n${String(smsRaw).replace(/\\n/g, '\n')}` : ''
+
+	const AUTO_CLAIM_ADMIN = process.env.AUTO_CLAIM_ADMIN || ''
+	const redirectNote =
+		AUTO_CLAIM_ADMIN && managerAt
+			? `\n\n🔄 [REDIRECTED from @${managerAt}]`
+			: ''
+
 	return (
 		`Client #c${form?.client_id ?? '_'}\n` +
 		`Client name: ${clientName}\n` +
 		`Campaign: ${form?.cpmn_name ?? '_'}\n` +
-		`Phone: ${phone}${smsText}`
+		`Phone: ${phone}${smsText}${redirectNote}`
 	)
 }
 
@@ -413,7 +510,7 @@ const handleGatewayTelegramEvent = async payload => {
 				idempotencyKey: makeIdempotencyKey(`claim-dm-${form._id}`),
 				payload: {
 					chatId: String(claimerChatId),
-					text: formatClaimDm({ form, clientRef }),
+					text: formatClaimDm({ form, clientRef, managerAt }),
 				},
 			})
 		} catch (error) {
@@ -472,6 +569,7 @@ module.exports = {
 	sendRepeatCallNotification,
 	sendRepeatSmsNotification,
 	sendMissedCallNotification,
+	sendDirectLeadNotificationToGateway,
 	handleGatewayTelegramEvent,
 	verifyGatewayEventHeaders,
 }
