@@ -232,22 +232,35 @@ const buildLeadMessage = ({
 	const orderBlock = orderIdsText ? `\n\n📋 Прошлые заказы:${orderIdsText}` : ''
 
 	const statusLabel = getClientStatusLabel({ hasRecentOrder, hasAnyOrder })
-	const delegationLine = delegatedFromAt ? `\n🕒 Delegated from @${delegatedFromAt}` : ''
+	const delegationLine = delegatedFromAt ? `\n\n🕒 Delegated from @${delegatedFromAt}` : ''
 	const phoneLine = customerNumber ? `\nPhone: ${customerNumber}` : ''
+	const callStatusLine = callResult ? `\nСтатус звонка: ${callResult}` : ''
 
-	if (type === 'call') {
-		return `📞 Повторный звонок\nКлиент: #c${clientNumericId}${phoneLine}\nСтатус: ${statusLabel}${delegationLine}${orderBlock}`
-	}
+	// Determine lead label based on type and whether client has orders
+	let leadLabel = '🆕 Новый лид'
 	if (type === 'missed_call') {
-		const callStatusLine = callResult ? `\nЗвонок: ${callResult}` : ''
-		return `☎️ Пропущенный звонок\nКлиент: #c${clientNumericId}${phoneLine}\nСтатус: ${statusLabel}${callStatusLine}${delegationLine}${orderBlock}`
+		leadLabel = '☎️ Пропущенный звонок'
+	} else if (type === 'call') {
+		leadLabel = hasAnyOrder ? '📞 Повторный звонок' : '📞 Входящий звонок'
+	} else if (type === 'sms') {
+		leadLabel = hasAnyOrder ? '💬 Повторное СМС' : '💬 Входящее СМС'
+	} else if (type === 'direct') {
+		leadLabel = hasAnyOrder ? '📞 Повторный звонок' : '📞 Входящий звонок'
 	}
-	if (type === 'sms') {
-		const formattedSms = message ? message.replace(/\\n/g, '\n') : ''
-		const smsContent = formattedSms ? `\n\n💬 Текст СМС:\n${formattedSms}` : ''
-		return `💬 Входящее СМС\nКлиент: #c${clientNumericId}${phoneLine}\nСтатус: ${statusLabel}${delegationLine}${smsContent}${orderBlock}`
-	}
-	return `🆕 Новый лид\nКлиент: #c${clientNumericId}${phoneLine}\nСтатус: ${statusLabel}${delegationLine}${orderBlock}`
+
+	const formattedSms = message ? message.replace(/\\n/g, '\n') : ''
+	const smsContent = formattedSms ? `\n\n💬 Текст СМС:\n${formattedSms}` : ''
+
+	return (
+		`${leadLabel}\n` +
+		`${statusLabel}\n` +
+		`Клиент: #c${clientNumericId}` +
+		phoneLine +
+		callStatusLine +
+		delegationLine +
+		orderBlock +
+		smsContent
+	)
 }
 
 const sendLeadNotificationToGateway = async ({ type, leadData }) => {
