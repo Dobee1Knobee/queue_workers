@@ -52,8 +52,35 @@ app.get('/test-gateway', async (req, res) => {
 		})
 		res.json({ success: true, result, target })
 	} catch (error) {
-		res.status(500).json({ success: false, error: error.message })
+		res.status(500).json({ success: false, error: error.message, stack: error.stack })
 	}
+})
+
+app.get('/debug', async (req, res) => {
+	const { isGatewayEnabled, gatewayPostInternal, makeIdempotencyKey, getGatewayChatTarget } = require('./utils/gatewayFlow')
+	
+	const debug = {
+		env: {
+			TELEGRAM_GATEWAY_ENABLED: process.env.TELEGRAM_GATEWAY_ENABLED,
+			TELEGRAM_GATEWAY_URL: process.env.TELEGRAM_GATEWAY_URL,
+			TELEGRAM_GATEWAY_CALLER_ID: process.env.TELEGRAM_GATEWAY_CALLER_ID,
+			TELEGRAM_GATEWAY_API_KEY: process.env.TELEGRAM_GATEWAY_API_KEY ? '***SET***' : 'NOT SET',
+			TELEGRAM_GATEWAY_CHAT_ID: process.env.TELEGRAM_GATEWAY_CHAT_ID,
+			TELEGRAM_GATEWAY_REDIRECT_DM: process.env.TELEGRAM_GATEWAY_REDIRECT_DM,
+		},
+		gateway_enabled: isGatewayEnabled(),
+		rabbit_connected: !!rabbitState.connection,
+		node_env: process.env.NODE_ENV,
+	}
+	
+	try {
+		const target = getGatewayChatTarget()
+		debug.chat_target = target
+	} catch (e) {
+		debug.chat_target_error = e.message
+	}
+	
+	res.json(debug)
 })
 
 // Endpoint для приема webhook SMS
