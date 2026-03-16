@@ -83,6 +83,40 @@ app.get('/debug', async (req, res) => {
 	res.json(debug)
 })
 
+app.get('/test-call-flow', async (req, res) => {
+	const { zoomThreadCallIn } = require('./utils/zoom/zoomThreadCallIn')
+	
+	// Simulate a simple missed call
+	const testCallData = {
+		body: {
+			payload: {
+				object: {
+					call_logs: [{
+						direction: 'inbound',
+						duration: 0,
+						result: 'no answer',
+						caller_number: '+1234567890',
+						callee_number: '+1098765432',
+						caller_number_source: 'external',
+						callee_number_source: 'internal',
+						caller_extension_number: null,
+						callee_extension_number: '100',
+					}]
+				}
+			}
+		}
+	}
+	
+	try {
+		console.log('🧪 Testing call flow with simulated missed call...')
+		const result = await zoomThreadCallIn(testCallData)
+		res.json({ success: true, result })
+	} catch (error) {
+		console.error('❌ Test call flow error:', error)
+		res.status(500).json({ success: false, error: error.message, stack: error.stack })
+	}
+})
+
 // Endpoint для приема webhook SMS
 app.post('/webhook/sms', (req, res) => {
 	console.log('📨 Webhook SMS получен:', req.body)
