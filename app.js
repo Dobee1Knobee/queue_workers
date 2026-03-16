@@ -117,6 +117,20 @@ app.get('/test-call-flow', async (req, res) => {
 	}
 })
 
+app.post('/test-callback', async (req, res) => {
+	const { handleGatewayTelegramEvent } = require('./utils/gatewayFlow')
+	
+	console.log('🧪 Test callback received:', JSON.stringify(req.body, null, 2))
+	
+	try {
+		const result = await handleGatewayTelegramEvent(req.body)
+		res.json({ success: true, result })
+	} catch (error) {
+		console.error('❌ Test callback error:', error)
+		res.status(500).json({ success: false, error: error.message, stack: error.stack })
+	}
+})
+
 // Endpoint для приема webhook SMS
 app.post('/webhook/sms', (req, res) => {
 	console.log('📨 Webhook SMS получен:', req.body)
