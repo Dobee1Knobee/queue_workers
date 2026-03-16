@@ -56,15 +56,9 @@ const buildValueVariants = value => {
 
 const parseClaimClientId = callbackData => {
 	if (typeof callbackData !== 'string') return null
-	if (callbackData.startsWith('zoom_claim:')) {
+	if (callbackData.startsWith('claim:zoom:')) {
 		const parts = callbackData.split(':')
 		return parts[parts.length - 1] // The last part is the client ID
-	}
-	if (callbackData.startsWith('claim:')) {
-		const raw = callbackData.slice('claim:'.length).trim()
-		if (!raw) return null
-		const numeric = Number(raw)
-		return Number.isFinite(numeric) ? numeric : raw
 	}
 	return null
 }
@@ -261,7 +255,7 @@ const sendLeadNotificationToGateway = async ({ type, leadData }) => {
 			text,
 			replyMarkup: {
 				inlineKeyboard: [
-					[{ text: 'Claim', callbackData: `zoom_claim:${claimType}:${clientNumericId}` }],
+					[{ text: 'Claim', callbackData: `claim:zoom:${claimType}:${clientNumericId}` }],
 				],
 			},
 		},
@@ -319,7 +313,7 @@ const sendDirectLeadNotificationToGateway = async leadData => {
 	const text = buildLeadMessage({
 		type: leadData.lead_type === 'missed_call' ? 'missed_call' : 'direct',
 		clientNumericId,
-		customerNumber, // Include phone in direct DMs
+		customerNumber: leadData.customer_number,
 		recentOrders: leadData.orders || [],
 		callResult: leadData.result || '',
 		hasRecentOrder: leadData.has_recent_order,
@@ -399,7 +393,7 @@ const handleGatewayTelegramEvent = async payload => {
 	}
 
 	const callback = extractGatewayCallback(payload)
-	if (!callback.callbackData || (!callback.callbackData.startsWith('claim:') && !callback.callbackData.startsWith('zoom_claim:'))) {
+	if (!callback.callbackData || !callback.callbackData.startsWith('claim:zoom:')) {
 		return { handled: false, reason: 'ignored non-claim callback' }
 	}
 	const claimClientId = parseClaimClientId(callback.callbackData)
