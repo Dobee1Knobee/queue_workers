@@ -75,8 +75,19 @@ const parseClaimClientId = callbackData => {
 }
 
 const getGatewayChatTarget = () => {
-	if (GATEWAY_CHAT_ALIAS) return { chatAlias: GATEWAY_CHAT_ALIAS }
-	if (GATEWAY_CHAT_ID) return { chatId: String(GATEWAY_CHAT_ID) }
+	logger.info(`🎯 getGatewayChatTarget called:`)
+	logger.info(`   GATEWAY_CHAT_ALIAS: "${GATEWAY_CHAT_ALIAS}"`)
+	logger.info(`   GATEWAY_CHAT_ID: "${GATEWAY_CHAT_ID}"`)
+	
+	if (GATEWAY_CHAT_ALIAS) {
+		logger.info(`🎯 Returning chatAlias: ${GATEWAY_CHAT_ALIAS}`)
+		return { chatAlias: GATEWAY_CHAT_ALIAS }
+	}
+	if (GATEWAY_CHAT_ID) {
+		logger.info(`🎯 Returning chatId: ${GATEWAY_CHAT_ID}`)
+		return { chatId: String(GATEWAY_CHAT_ID) }
+	}
+	logger.error(`❌ Neither GATEWAY_CHAT_ALIAS nor GATEWAY_CHAT_ID is set!`)
 	throw new Error(
 		'TELEGRAM_GATEWAY_CHAT_ID/TELEGRAM_CHAT_ID or TELEGRAM_GATEWAY_CHAT_ALIAS must be configured'
 	)
@@ -245,6 +256,9 @@ const sendLeadNotificationToGateway = async ({ type, leadData }) => {
 	const messageText = leadData.message || ''
 	const recentOrders = leadData.orders || []
 	const callResult = leadData.result || ''
+	
+	logger.info(`📤 sendLeadNotificationToGateway: type=${type}, client=${clientNumericId}`)
+	
 	const text = buildLeadMessage({
 		type,
 		clientNumericId,
@@ -258,11 +272,14 @@ const sendLeadNotificationToGateway = async ({ type, leadData }) => {
 	})
 
 	const claimType = type === 'sms' ? 'sms' : type === 'missed_call' ? 'missed' : 'rpt'
+	const chatTarget = getGatewayChatTarget()
+	logger.info(`📤 Sending to: ${JSON.stringify(chatTarget)}`)
+	
 	const sendResp = await gatewayPostInternal({
 		operationType: 'send_message',
 		idempotencyKey: makeIdempotencyKey(`lead-${type}-${clientNumericId}`),
 		payload: {
-			...getGatewayChatTarget(),
+			...chatTarget,
 			text,
 			replyMarkup: {
 				inlineKeyboard: [
