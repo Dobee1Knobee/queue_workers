@@ -336,7 +336,7 @@ const zoomThreadSmsIn = async data => {
 			// First check: does client have a claimed manager (< 2 weeks)?
 			const claimedManager = await findClaimedManagerForClient(clientNumericId, tvmountConn)
 			
-			// Has claimed manager → DM directly
+			// Has claimed manager (< 2 weeks) → DM
 			if (claimedManager && claimedManager.at) {
 				logger.info(
 					`📱 Incoming SMS - client has claimed manager @${claimedManager.at}`
@@ -354,6 +354,9 @@ const zoomThreadSmsIn = async data => {
 					team: claimedManager.team,
 					has_any_order: hasAnyOrder,
 					has_recent_order: hasRecentOrder,
+					manager_resolution_method: claimedManager.delegated_from_at ? 'delegated' : 'direct',
+					delegated_from_at: claimedManager.delegated_from_at || null,
+					delegated_from_manager_id: claimedManager.delegated_from_manager_id || null,
 				}
 
 				const dedupKey = `new_inbound_lead_${clientNumericId}`
@@ -368,10 +371,10 @@ const zoomThreadSmsIn = async data => {
 					)
 				}
 			}
-			// No claimed manager, but manager found from to_members → DM
-			else if (responsibleManager && responsibleManager.at) {
+			// Has recent order (< 2 weeks) → DM
+			else if (hasRecentOrder && responsibleManager && responsibleManager.at) {
 				logger.info(
-					`📱 Incoming SMS - sending DM to @${responsibleManager.at}`
+					`📱 Incoming SMS - active client, sending DM to @${responsibleManager.at}`
 				)
 
 				const inboundLeadData = {
@@ -386,6 +389,7 @@ const zoomThreadSmsIn = async data => {
 					team: responsibleManager.team,
 					has_any_order: hasAnyOrder,
 					has_recent_order: hasRecentOrder,
+					manager_resolution_method: 'direct',
 				}
 
 				const dedupKey = `new_inbound_lead_${clientNumericId}`
@@ -400,10 +404,10 @@ const zoomThreadSmsIn = async data => {
 					)
 				}
 			}
-			// No manager at all → group + claim button
+			// New client OR repeat client (> 2 weeks) → group + claim button
 			else {
 				logger.info(
-					`📱 Incoming SMS - no manager, sending to group`
+					`📱 Incoming SMS - new/repeat client, sending to group`
 				)
 
 				const dedupKey = `sms_${clientNumericId}`

@@ -379,7 +379,6 @@ async def zoom_repeat_call_in(data):
         # Format date if available
         date_line = f"\n📅 {date_time}" if date_time else ""
         team_line = f"\n👥 Команда: {team}" if team else ""
-        owner_line = f"\n👤 Owner: @{manager_at}" if manager_at else ""
         
         # For missed calls, check if client was claimed within last 2 weeks
         # If yes, route directly to that manager's DM
@@ -440,7 +439,6 @@ async def zoom_repeat_call_in(data):
             f"{status_line}"
             f"{date_line}"
             f"{team_line}"
-            f"{owner_line}"
             f"{order_block}"
         )
 
@@ -645,6 +643,9 @@ async def zoom_new_inbound_lead(data):
         has_any_order = data.get("has_any_order", False)
         has_recent_order = data.get("has_recent_order", False)
         
+        # Delegation info
+        delegated_from_at = data.get("delegated_from_at")
+        
         manager = users_db.find_one({"at": manager_at}) if manager_at else None
         
         if not manager:
@@ -658,6 +659,9 @@ async def zoom_new_inbound_lead(data):
             redirect_note = f"\n\n🔄 [REDIRECTED from @{manager_at}]"
         else:
             redirect_note = ""
+        
+        # Add delegation note if present
+        delegation_note = f"\n\n🔄 [Delegated from @{delegated_from_at}]" if delegated_from_at else ""
         
         if not manager_chat_id:
             print(f"⚠️ [new_inbound_lead] Manager @{manager_at} has no chat_id, skipping")
@@ -678,6 +682,9 @@ async def zoom_new_inbound_lead(data):
         elif lead_type == "active_call":
             content_text = f"Статус: {call_result}" if call_result else ""
             lead_label = "☎️ Звонок от активного клиента"
+        elif lead_type == "missed_call":
+            content_text = f"Статус: {call_result or 'missed'}"
+            lead_label = "☎️ Пропущенный звонок"
         else:
             content_text = f"Статус: {call_result}" if call_result else ""
             lead_label = "☎️ Входящий звонок"
@@ -693,6 +700,7 @@ async def zoom_new_inbound_lead(data):
                 f"Phone: {customer_number}"
                 f"{ext_info}\n"
                 f"{content_text}"
+                f"{delegation_note}"
                 f"{redirect_note}"
             ),
             parse_mode="HTML",

@@ -427,6 +427,10 @@ const zoomThreadCallIn = async data => {
 						team: claimedManager.team,
 						has_any_order: hasAnyOrder,
 						has_recent_order: hasRecentOrder,
+						// Extra fields for delegation/tracking
+						manager_resolution_method: claimedManager.delegated_from_at ? 'delegated' : 'direct',
+						delegated_from_at: claimedManager.delegated_from_at || null,
+						delegated_from_manager_id: claimedManager.delegated_from_manager_id || null,
 					}
 
 					const dedupKey = `new_inbound_lead_${clientNumericId}`
@@ -504,6 +508,7 @@ const zoomThreadCallIn = async data => {
 						duration: duration,
 						has_recent_order: hasRecentOrder,
 						has_any_order: hasAnyOrder,
+						manager_resolution_method: 'direct',
 					}
 
 					const dedupKey = `new_inbound_lead_${clientNumericId}`
