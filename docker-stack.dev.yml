@@ -61,9 +61,13 @@ services:
         order: stop-first
     networks:
       - backend
+      - telegram-bot
 
 networks:
   backend:
     name: ${QUEUE_WORKERS_DEV_BACKEND_NETWORK:-queue-workers-dev-backend}
     driver: overlay
     attachable: true
+  telegram-bot:
+    external: true
+    name: telegram-bot
