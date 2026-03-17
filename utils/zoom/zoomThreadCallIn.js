@@ -491,31 +491,30 @@ const zoomThreadCallIn = async data => {
 						logger.info(`⏭️ Дедупликация: уже отправлен`)
 						return
 					}
-					recentRepeatClients.set(dedupKey, Date.now())
+recentRepeatClients.set(dedupKey, Date.now())
 					logger.info(`🚀 Sending missed call to gateway: isGatewayEnabled=${isGatewayEnabled()}`)
 
-						const missedCallData = {
-							client_id: clientId,
-							client_numeric_id: clientNumericId,
-							customer_number: customerNumber,
-							orders: allOrders,
-							direction,
-							ext,
-							duration,
-							result,
-							date_time: callEndDate,
-							lead_type: 'missed_call',
-							team: responsibleManager?.team || null,
-							manager_at: responsibleManager?.at || null,
-							manager_id: responsibleManager?.manager_id || null,
-							zoomData: data,
-						}
+					const missedCallData = {
+						client_id: clientId,
+						client_numeric_id: clientNumericId,
+						customer_number: customerNumber,
+						orders: allOrders,
+						direction,
+						ext,
+						duration,
+						result,
+						date_time: callEndDate,
+						lead_type: 'missed_call',
+						team: responsibleManager?.team || null,
+						manager_at: responsibleManager?.at || null,
+						manager_id: responsibleManager?.manager_id || null,
+						zoomData: data,
+					}
 
-						if (isGatewayEnabled()) {
-							await sendMissedCallNotification(missedCallData)
-						} else {
-							await sendToQueue('repeat_call_in', missedCallData)
-						}
+					if (isGatewayEnabled()) {
+						await sendMissedCallNotification(missedCallData)
+					} else {
+						await sendToQueue('repeat_call_in', missedCallData)
 					}
 				}
 			}
