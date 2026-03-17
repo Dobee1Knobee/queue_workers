@@ -449,32 +449,34 @@ const zoomThreadCallIn = async data => {
 						delegated_from_manager_id: claimedManager.delegated_from_manager_id || null,
 					}
 
-					const dedupKey = `new_inbound_lead_${clientNumericId}`
+					// Use SAME dedupKey for all inbound calls
+					const dedupKey = `inbound_call_${clientNumericId}`
 					const lastSent = recentRepeatClients.get(dedupKey)
 					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
 						logger.info(`⏭️ Дедупликация: уже отправлен`)
-					} else {
-						recentRepeatClients.set(dedupKey, Date.now())
-						logger.info(`🚀 Sending to gateway: isGatewayEnabled=${isGatewayEnabled()}`)
-						
-						if (isGatewayEnabled()) {
-							logger.info(`🚀 Calling sendDirectLeadNotificationToGateway...`)
-							try {
-								const result = await sendDirectLeadNotificationToGateway(inboundLeadData)
-								logger.info(`✅ Gateway response: ${JSON.stringify(result)}`)
-							} catch (gwError) {
-								logger.error(`❌ Gateway error: ${gwError.message}`)
-								logger.error(`❌ Stack: ${gwError.stack}`)
-							}
-						} else {
-							logger.info(`🚀 Gateway disabled - sending to queue`)
-							await sendToQueue('new_inbound_lead', inboundLeadData)
-						}
-
-						logger.info(
-							`✅ missed_call DM отправлен @${claimedManager.at} (client=${clientNumericId})`
-						)
+						return
 					}
+					recentRepeatClients.set(dedupKey, Date.now())
+					logger.info(`🚀 Sending to gateway: isGatewayEnabled=${isGatewayEnabled()}`)
+					
+					if (isGatewayEnabled()) {
+						logger.info(`🚀 Calling sendDirectLeadNotificationToGateway...`)
+						try {
+							const result = await sendDirectLeadNotificationToGateway(inboundLeadData)
+							logger.info(`✅ Gateway response: ${JSON.stringify(result)}`)
+						} catch (gwError) {
+							logger.error(`❌ Gateway error: ${gwError.message}`)
+							logger.error(`❌ Stack: ${gwError.stack}`)
+						}
+					} else {
+						logger.info(`🚀 Gateway disabled - sending to queue`)
+						await sendToQueue('new_inbound_lead', inboundLeadData)
+					}
+
+					logger.info(
+						`✅ missed_call DM отправлен @${claimedManager.at} (client=${clientNumericId})`
+					)
+					return  // STOP HERE - don't send group message
 				}
 				// No claimed manager → group + claim button
 				else {
@@ -482,13 +484,15 @@ const zoomThreadCallIn = async data => {
 						`📬 No claimed manager - sending to group`
 					)
 
-					const dedupKey = `missed_call_${clientNumericId}`
+					// Use SAME dedupKey for all inbound calls
+					const dedupKey = `inbound_call_${clientNumericId}`
 					const lastSent = recentRepeatClients.get(dedupKey)
 					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
 						logger.info(`⏭️ Дедупликация: уже отправлен`)
-					} else {
-						recentRepeatClients.set(dedupKey, Date.now())
-						logger.info(`🚀 Sending missed call to gateway: isGatewayEnabled=${isGatewayEnabled()}`)
+						return
+					}
+					recentRepeatClients.set(dedupKey, Date.now())
+					logger.info(`🚀 Sending missed call to gateway: isGatewayEnabled=${isGatewayEnabled()}`)
 
 						const missedCallData = {
 							client_id: clientId,
@@ -539,25 +543,27 @@ const zoomThreadCallIn = async data => {
 						manager_resolution_method: 'direct',
 					}
 
-					const dedupKey = `new_inbound_lead_${clientNumericId}`
+					// Use SAME dedupKey for all inbound calls
+					const dedupKey = `inbound_call_${clientNumericId}`
 					const lastSent = recentRepeatClients.get(dedupKey)
 					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
 						logger.info(
-							`⏭️ Дедупликация: inbound lead для клиента ${clientNumericId} уже отправлен`
+							`⏭️ Дедупликация: inbound call для клиента ${clientNumericId} уже отправлен`
 						)
-					} else {
-						recentRepeatClients.set(dedupKey, Date.now())
-
-						if (isGatewayEnabled()) {
-							await sendDirectLeadNotificationToGateway(inboundLeadData)
-						} else {
-							await sendToQueue('new_inbound_lead', inboundLeadData)
-						}
-
-						logger.info(
-							`✅ new_inbound_lead отправлен для answered call client=${clientNumericId}, manager=${responsibleManager.at}`
-						)
+						return
 					}
+					recentRepeatClients.set(dedupKey, Date.now())
+
+					if (isGatewayEnabled()) {
+						await sendDirectLeadNotificationToGateway(inboundLeadData)
+					} else {
+						await sendToQueue('new_inbound_lead', inboundLeadData)
+					}
+
+					logger.info(
+						`✅ answered_call DM отправлен @${responsibleManager.at} (client=${clientNumericId})`
+					)
+					return  // STOP HERE - don't send group message
 				}
 				// No manager found - this shouldn't happen for queue calls, but handle it
 				else {
@@ -565,34 +571,37 @@ const zoomThreadCallIn = async data => {
 						`📞 Answered inbound call but no manager found - sending to group`
 					)
 
-					const dedupKey = `repeat_call_${clientNumericId}`
+					// Use SAME dedupKey for all inbound calls
+					const dedupKey = `inbound_call_${clientNumericId}`
 					const lastSent = recentRepeatClients.get(dedupKey)
 					if (lastSent && Date.now() - lastSent < REPEAT_DEDUP_MS) {
-						logger.info(`⏭️ Дедупликация: repeat_call уже отправлен`)
+						logger.info(`⏭️ Дедупликация: inbound call уже отправлен`)
+						return
+					}
+					recentRepeatClients.set(dedupKey, Date.now())
+
+					const repeatCallData = {
+						client_id: clientId,
+						client_numeric_id: clientNumericId,
+						customer_number: customerNumber,
+						orders: allOrders,
+						direction: direction,
+						ext: ext,
+						duration: duration,
+						result: result,
+						date_time: callEndDate,
+						team: null,
+						manager_at: null,
+						manager_id: null,
+						has_any_order: hasAnyOrder,
+						has_recent_order: hasRecentOrder,
+						zoomData: data,
+					}
+
+					if (isGatewayEnabled()) {
+						await sendRepeatCallNotification(repeatCallData)
 					} else {
-						recentRepeatClients.set(dedupKey, Date.now())
-
-						const repeatCallData = {
-							client_id: clientId,
-							client_numeric_id: clientNumericId,
-							customer_number: customerNumber,
-							orders: allOrders,
-							direction: direction,
-							ext: ext,
-							duration: duration,
-							result: result,
-							date_time: callEndDate,
-							team: null,
-							manager_at: null,
-							manager_id: null,
-							zoomData: data
-						}
-
-						if (isGatewayEnabled()) {
-							await sendRepeatCallNotification(repeatCallData)
-						} else {
-							await sendToQueue('repeat_call_in', repeatCallData)
-						}
+						await sendToQueue('repeat_call_in', repeatCallData)
 					}
 				}
 			}
